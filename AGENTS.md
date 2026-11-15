@@ -21,7 +21,7 @@ no login, no API keys.
 | `mpris.py` | MPRIS client. Primary: `PySide6.QtDBus`. Fallback: `playerctl` CLI. `list_players()`, `get_track()`, `play_pause()`, `next_track()`, `previous_track()`, `seek()`. `TrackInfo` dataclass. |
 | `lyrics.py` | LRC parser + LRCLIB client + demo fixture. `parse_lrc()`, `fetch_lrclib()`, `LyricsResult`, `LyricLine`, `LRCLIBRateLimited`, `demo_result()`. |
 | `test_lyrics.py` | Tests for `lyrics.py` only (no Qt needed). Runnable as `python3 test_lyrics.py` or `pytest`. |
-| `install.sh` | CachyOS/Arch one-command install: pacman `python-pyside6` + `playerctl`, launcher `~/.local/bin/synced-lyrics`, desktop file `~/.local/share/applications/synced-lyrics-linux.desktop`. |
+| `install.sh` | CachyOS/Arch one-command install: pacman `pyside6` + `playerctl`, launcher `~/.local/bin/synced-lyrics`, desktop file `~/.local/share/applications/synced-lyrics-linux.desktop`. |
 | `requirements.txt` | `PySide6>=6.6` — pip fallback only; prefer the distro package. |
 | `docs/ARCHITECTURE.md` | Data-flow diagram + mode/tray/display behaviour. |
 

@@ -6,7 +6,7 @@
 #   ./install.sh
 #
 # What it does:
-#   1. Installs python-pyside6 from the Arch/CachyOS repos (or, if pacman
+#   1. Installs pyside6 from the Arch/CachyOS repos (or, if pacman
 #      is not available, creates a venv and pip-installs PySide6).
 #   2. Installs playerctl (optional, MPRIS fallback) if pacman is present.
 #   3. Creates ~/.local/bin/synced-lyrics launcher.
@@ -24,9 +24,18 @@ echo "== synced-lyrics-linux installer =="
 echo "App directory: $APP_DIR"
 
 if command -v pacman >/dev/null 2>&1; then
-    echo "-- Installing python-pyside6 + playerctl via pacman (sudo) --"
-    sudo pacman -S --needed --noconfirm python-pyside6 playerctl
+    echo "-- Installing pyside6 + playerctl via pacman (sudo) --"
+    # Arch/CachyOS package is 'pyside6', not 'python-pyside6'
+    # (that name is Debian/Fedora-style and pacman reports
+    # 'target not found' for it).
+    sudo pacman -S --needed --noconfirm pyside6 playerctl
     PYTHON=python3
+    if ! python3 -c "import PySide6" 2>/dev/null; then
+        echo "-- pacman pyside6 did not provide PySide6; falling back to a venv --"
+        python3 -m venv "$APP_DIR/.venv"
+        "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+        PYTHON="$APP_DIR/.venv/bin/python"
+    fi
 elif command -v apt-get >/dev/null 2>&1; then
     echo "-- Installing python3-pyside6 via apt (sudo) --"
     sudo apt-get update

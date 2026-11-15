@@ -79,7 +79,7 @@ chmod +x install.sh
 > (fish) / `Permission denied` (bash). The `chmod +x install.sh` line
 > above fixes that. `bash install.sh` also works without it.
 
-`install.sh` installs `python-pyside6` + `playerctl` via pacman (with
+`install.sh` installs `pyside6` + `playerctl` via pacman (with
 sudo — run it yourself), then creates a `synced-lyrics` launcher in
 `~/.local/bin/` and a `synced-lyrics-linux.desktop` file so the app
 appears in the KDE application launcher.
