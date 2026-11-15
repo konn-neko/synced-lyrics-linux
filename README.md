@@ -40,7 +40,8 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   Overlay alike), instead of the whole line flipping at once. Better
   Lyrics TTML carries syllable timings too, so the colour washes
   across a word mid-word, syllable by syllable, instead of the whole
-  word snapping at once. Tracks without word timings fall back to
+  word snapping at once — the character the sweep is passing through
+  fades smoothly from dim to crimson as it's sung. Tracks without word timings fall back to
   line-only highlighting, exactly as before. `--demo` shows the
   effect on the sample lyrics.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay

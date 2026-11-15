@@ -41,6 +41,7 @@ from synced_lyrics import (  # noqa: E402
     LyricsItemDelegate,
     SmoothScroller,
     _lerp_color,
+    _lerp_hex,
     build_display_menu,
     build_lyrics_debug_text,
     render_line_html,
@@ -307,9 +308,19 @@ def _html_spans(html_text):
         r'<span style="color:([^;]+);[^"]*">(.*?)</span>', html_text)]
 
 
+def test_lerp_hex():
+    assert _lerp_hex("#8b949e", "#FF1A47", 0.0) == "#8b949e"
+    assert _lerp_hex("#8b949e", "#FF1A47", 1.0) == "#ff1a47"
+    assert _lerp_hex("#8b949e", "#FF1A47", 0.5) == "#c55772"
+    assert _lerp_hex("bogus", "#FF1A47", 0.25) == "bogus"
+    print("  _lerp_hex: OK (endpoints, midpoint, bad input)")
+
+
 def test_render_line_html_sweep():
-    """Mid-word sweep: the active word lights up part by part as the
-    position moves through it, instead of snapping whole to crimson."""
+    """Mid-word sweep + transition: the active word lights up part by
+    part as the position moves through it, and the character the
+    sweep front is inside gets an intermediate colour — a smooth
+    gradient wash, not whole characters snapping to crimson."""
     line = LyricLine(1.05, "Virtual Insanity", [
         LyricWord(1.05, 1.71, "Virtual", parts=[
             LyricWord(1.05, 1.39, "Vir-"), LyricWord(1.39, 1.71, "tual")]),
@@ -318,27 +329,34 @@ def test_render_line_html_sweep():
     # pos=None (old behaviour): active word fully sung, one span per part.
     assert _html_spans(render_line_html(line, 0)) == [
         ("#FF1A47", "Vir-"), ("#FF1A47", "tual"), ("#8b949e", "Insanity")]
-    # Mid first syllable (1.20, ~44% through "Vir-"): "Vi" sung, rest dim.
-    assert _html_spans(render_line_html(line, 0, 1.20)) == [
-        ("#FF1A47", "Vi"), ("#8b949e", "r-"), ("#8b949e", "tual"),
-        ("#8b949e", "Insanity")]
-    # Mid second syllable (1.55): first part fully sung, "tu" sung, "al" dim.
+    # Mid first syllable (1.20, ~44% through "Vir-"): "V" sung, "i"
+    # mid-transition (neither crimson nor dim), rest dim.
+    spans = _html_spans(render_line_html(line, 0, 1.20))
+    assert spans[0] == ("#FF1A47", "V"), spans
+    assert spans[1][1] == "i" and spans[1][0] not in ("#FF1A47", "#8b949e"), spans
+    assert spans[2:] == [("#8b949e", "r"), ("#8b949e", "-"),
+                         ("#8b949e", "tual"), ("#8b949e", "Insanity")], spans
+    # Mid second syllable (1.55, exactly half of "tual"): "t","u" sung.
     assert _html_spans(render_line_html(line, 0, 1.55)) == [
-        ("#FF1A47", "Vir-"), ("#FF1A47", "tu"), ("#8b949e", "al"),
-        ("#8b949e", "Insanity")]
+        ("#FF1A47", "Vir-"), ("#FF1A47", "t"), ("#FF1A47", "u"),
+        ("#8b949e", "a"), ("#8b949e", "l"), ("#8b949e", "Insanity")]
     # Before the word starts: everything dim.
     assert all(c == "#8b949e"
                for c, _ in _html_spans(render_line_html(line, 0, 0.5)))
-    # Second word active (1.80): first word fully sung (one span —
-    # completed words render whole), "In" sung.
-    assert _html_spans(render_line_html(line, 1, 1.80)) == [
-        ("#FF1A47", "Virtual"), ("#FF1A47", "In"),
-        ("#8b949e", "sanity")]
+    # Second word active (1.80): first word fully sung (one span),
+    # "I" sung, "n" mid-transition, rest dim.
+    spans = _html_spans(render_line_html(line, 1, 1.80))
+    assert spans[0] == ("#FF1A47", "Virtual"), spans
+    assert spans[1] == ("#FF1A47", "I"), spans
+    assert spans[2][1] == "n" and spans[2][0] not in ("#FF1A47", "#8b949e"), spans
+    assert spans[3:] == [("#8b949e", c) for c in "sanity"], spans
     # No parts: the sweep runs across the whole word (5.0-7.0 s).
     plain = LyricLine(5.0, "stars", [LyricWord(5.0, 7.0, "stars")])
-    assert _html_spans(render_line_html(plain, 0, 6.0)) == [
-        ("#FF1A47", "st"), ("#8b949e", "ars")]
-    print("  render_line_html sweep: OK (syllable split, char split, no-parts word)")
+    spans = _html_spans(render_line_html(plain, 0, 6.0))
+    assert spans[0] == ("#FF1A47", "s") and spans[1] == ("#FF1A47", "t"), spans
+    assert spans[2][1] == "a" and spans[2][0] not in ("#FF1A47", "#8b949e"), spans
+    assert spans[3:] == [("#8b949e", "r"), ("#8b949e", "s")], spans
+    print("  render_line_html sweep: OK (syllable split, gradient wash, no-parts word)")
 
 
 def test_lyrics_debug_text(app):
@@ -487,6 +505,7 @@ def main():
     test_single_instance_lock()
     test_local_server_raise(app)
     test_render_line_html()
+    test_lerp_hex()
     test_render_line_html_sweep()
     test_lyrics_debug_text(app)
     test_lyrics_delegate_and_scroll(app)

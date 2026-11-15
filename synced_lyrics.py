@@ -221,16 +221,35 @@ def _word_span(text: str, color: str, sung: bool, is_background: bool) -> str:
     return f'<span style="{style}">{html.escape(text)}</span>'
 
 
+def _lerp_hex(c1: str, c2: str, t: float) -> str:
+    """Interpolate two #RRGGBB colours; pure (no Qt) for tests.
+
+    Used by the word-transition wash: a character mid-sweep gets a
+    colour between the unsung and sung colours instead of flipping.
+    Falls back to the nearer endpoint for unparsable input.
+    """
+    try:
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    except (ValueError, IndexError):
+        return c2 if t >= 0.5 else c1
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    b = round(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def _render_word_sweep(word, pos: float | None, sung_color: str,
                        unsung_color: str) -> str:
     """Render one word with a mid-word sweep at `pos` (offset applied).
 
     Completed syllable parts are fully sung; the part containing `pos`
-    is split character-by-character by the fraction elapsed inside
-    that part, so the colour washes across the word as it is sung
-    instead of the whole word snapping to crimson at once. Parts
-    without timings sweep across the whole word. `pos=None` renders
-    the whole word sung (the old behaviour).
+    gets a smooth transition: the sweep front moves continuously
+    through it, and each character's colour interpolates between the
+    unsung and sung colours as the front passes — a gradient wash
+    across the word, instead of whole characters snapping from dim
+    to crimson. Parts without timings sweep across the whole word.
+    `pos=None` renders the whole word sung (the old behaviour).
     """
     parts = word.parts or [word]
     out = []
@@ -244,12 +263,22 @@ def _render_word_sweep(word, pos: float | None, sung_color: str,
         else:
             dur = max(0.001, part.end - part.time)
             frac = (pos - part.time) / dur
-            n = int(round(len(part.text) * frac))
-            n = max(0, min(len(part.text), n))
-            out.append(_word_span(part.text[:n], sung_color, True,
-                                  word.is_background))
-            out.append(_word_span(part.text[n:], unsung_color, False,
-                                  word.is_background))
+            n = len(part.text)
+            for j, ch in enumerate(part.text):
+                # How sung is this character: 1 once the front has
+                # fully passed it, 0 before the front reaches it, and
+                # a fraction while the front is inside it.
+                amount = max(0.0, min(1.0, frac * n - j))
+                if amount >= 1.0:
+                    out.append(_word_span(ch, sung_color, True,
+                                          word.is_background))
+                elif amount <= 0.0:
+                    out.append(_word_span(ch, unsung_color, False,
+                                          word.is_background))
+                else:
+                    color = _lerp_hex(unsung_color, sung_color, amount)
+                    out.append(_word_span(ch, color, False,
+                                          word.is_background))
     return "".join(out)
 
 
@@ -261,7 +290,9 @@ def render_line_html(line, word_idx: int, pos: float | None = None,
 
     Pure helper (no Qt widgets) so tests can cover it without windows.
     Words before `word_idx` are fully sung; the active word sweeps
-    mid-word when `pos` is given (see _render_word_sweep); the rest
+    mid-word when `pos` is given (see _render_word_sweep — the
+    character the sweep front is inside gets an intermediate colour,
+    so the highlight transitions smoothly across the word); the rest
     are unsung. Background-vocal words render italic. Lines without
     word timings return their plain text, HTML-escaped — exactly
     today's line-only rendering. With `pos=None` the active word is

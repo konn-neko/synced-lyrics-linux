@@ -201,14 +201,16 @@ no login, no API keys.
   word but keeps the spans with their own begin/end; ELRC/demo words
   get parts=[the word itself]). `render_line_html(line, word_idx, pos,
   offset)` renders the active word as a sweep: completed parts fully
-  sung, the part containing `pos` split character-by-character by the
-  elapsed fraction inside that part, later parts unsung. `pos=None`
-  renders the whole active word sung (the old behaviour). A 60 ms
-  QTimer in each window (`_on_fill_tick`) re-renders the current
-  line's fill from `engine.current_position()` and only calls setText
-  when the HTML actually changed; it never touches MPRIS — it reads
-  the monotonic estimate between 250 ms polls, and line changes still
-  go through `_highlight()` / the overlay crossfade.
+  sung, later parts unsung. The part containing `pos` transitions
+  smoothly: each character's colour interpolates between unsung and
+  sung (`_lerp_hex`) as the sweep front passes through it — a
+  gradient wash across the word, not whole characters snapping.
+  `pos=None` renders the whole active word sung (the old behaviour).
+  A 60 ms QTimer in each window (`_on_fill_tick`) re-renders the
+  current line's fill from `engine.current_position()` and only calls
+  setText when the HTML actually changed; it never touches MPRIS — it
+  reads the monotonic estimate between 250 ms polls, and line changes
+  still go through `_highlight()` / the overlay crossfade.
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
   + LRCLIB, via `log_request(url, status, body)` in `_get_json` and
   `fetch_betterlyrics`; album-art fetches in `synced_lyrics.py`
