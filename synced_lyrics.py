@@ -861,18 +861,27 @@ def _candidate_label(result) -> str:
              "synced" if result.has_synced else
              "plain only" if result.plain_lyrics else
              "instrumental" if result.instrumental else "no lyrics")
+    if result.source.startswith("betterlyrics"):
+        provider = "Better Lyrics"
+    elif result.source.startswith("qq"):
+        provider = "QQ Music"
+    elif result.source.startswith("kugou"):
+        provider = "Kugou"
+    else:
+        provider = "LRCLIB"
     dur = fmt_time(result.duration) if result.duration else "??:??"
     album = f"  •  {result.album}" if result.album else ""
-    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}"
+    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}  •  {provider}"
             + (f"  •  LRCLIB #{result.lrclib_id}" if result.lrclib_id else ""))
 
 
 class ChooseLyricsDialog(QDialog):
     """Pick which lyrics to use when several match the track.
 
-    Searches LRCLIB for the current track and lists every match
-    (word-synced first). The pick is applied immediately and cached
-    under the current track, so the next lookup loads it directly.
+    Searches every provider for the current track (Better Lyrics TTML,
+    QQ Music QRC, Kugou, LRCLIB) and lists every match, word-synced
+    first. The pick is applied immediately and cached under the
+    current track, so the next lookup loads it directly.
     """
 
     def __init__(self, parent, engine):
@@ -887,7 +896,7 @@ class ChooseLyricsDialog(QDialog):
         if current is not None:
             now += f"   —   now: {current.artist} — {current.track} [{current.source}]"
         layout.addWidget(QLabel(now))
-        self.status_label = QLabel("Searching LRCLIB …")
+        self.status_label = QLabel("Searching all providers …")
         layout.addWidget(self.status_label)
         self.list_widget = QListWidget(self)
         self.list_widget.itemDoubleClicked.connect(lambda _i: self._use_selected())
@@ -913,7 +922,7 @@ class ChooseLyricsDialog(QDialog):
             self.status_label.setText(results[1])
             return
         if not results:
-            self.status_label.setText("No matches on LRCLIB for this track.")
+            self.status_label.setText("No matches from any provider for this track.")
             return
         self.status_label.setText(f"{len(results)} match(es) — pick one:")
         for result in results:

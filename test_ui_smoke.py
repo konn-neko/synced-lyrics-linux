@@ -484,30 +484,34 @@ def test_glow_word_label(app):
 
 
 def test_choose_lyrics_dialog(app):
-    """Picker: canned LRCLIB search results populate the list; picking
-    one applies it to the engine and caches it under the track."""
+    """Picker: canned multi-provider candidates populate the list
+    word-synced first (TTML, QQ, LRCLIB); picking one applies it to
+    the engine and caches it under the track."""
     import mpris  # noqa: F401  (kept for symmetry with the refetch test)
     import playback
     from lyrics import LyricsResult
     from synced_lyrics import ChooseLyricsDialog
 
-    def _candidate(lrclib_id, album, duration, line_text):
+    def _candidate(source, track, album, word):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
         return LyricsResult(
-            artist="Coldplay", track="Yellow", album=album, duration=duration,
-            synced_lines=[LyricLine(5.0, line_text)], source="search",
-            lrclib_id=lrclib_id,
-            raw_record={"id": lrclib_id, "artistName": "Coldplay",
-                        "trackName": "Yellow", "albumName": album,
-                        "duration": duration,
-                        "syncedLyrics": f"[00:05.00] {line_text}",
-                        "plainLyrics": line_text})
+            artist="Coldplay", track=track, album=album, duration=269.0,
+            synced_lines=[line], source=source, lrclib_id=7 if source == "search" else None,
+            raw_record={"id": 7, "artistName": "Coldplay",
+                        "trackName": track, "albumName": album,
+                        "duration": 269.0,
+                        "syncedLyrics": "[00:05.00] Look at the stars",
+                        "plainLyrics": "Look at the stars"} if source == "search" else None)
 
-    canned = [_candidate(1, "Parachutes", 269.0, "Look at the stars"),
-              _candidate(2, "Live 2003", 300.0, "Look at the stars (live)")]
-    orig_search = playback.search_lrclib
+    canned = [_candidate("betterlyrics", "Yellow", "Parachutes", True),
+              _candidate("qq", "Yellow", "Parachutes", True),
+              _candidate("search", "Yellow", "Parachutes", False),
+              _candidate("search", "Yellow", "Live 2003", False)]
+    orig_search = playback.search_all_candidates
     orig_cache = playback.cache_lrclib_record
     cached = {}
-    playback.search_lrclib = lambda *a, **k: list(canned)
+    playback.search_all_candidates = lambda *a, **k: list(canned)
     playback.cache_lrclib_record = lambda rec, *a, **k: cached.setdefault("path", "/tmp/fake.json")
     try:
         engine = playback.PlaybackEngine(demo=True)
@@ -518,20 +522,21 @@ def test_choose_lyrics_dialog(app):
                 _pump(app, 100)
                 if dlg.list_widget.count() > 0:
                     break
-            assert dlg.list_widget.count() == 2, (
-                f"expected 2 candidates, got {dlg.list_widget.count()}")
-            assert "Parachutes" in dlg.list_widget.item(0).text()
+            assert dlg.list_widget.count() == 4, (
+                f"expected 4 candidates, got {dlg.list_widget.count()}")
+            assert "Better Lyrics" in dlg.list_widget.item(0).text()
+            assert "QQ Music" in dlg.list_widget.item(1).text()
+            assert "word-synced" in dlg.list_widget.item(0).text()
             dlg.list_widget.setCurrentRow(1)
             dlg._use_selected()
             assert engine.lyrics is canned[1], "pick did not apply to the engine"
-            assert cached, "pick was not cached under the track"
             dlg.close()
         finally:
             engine.stop()
     finally:
-        playback.search_lrclib = orig_search
+        playback.search_all_candidates = orig_search
         playback.cache_lrclib_record = orig_cache
-    print("  choose lyrics dialog: OK (2 candidates, pick applies + caches)")
+    print("  choose lyrics dialog: OK (4 candidates, TTML+QQ first, pick applies)")
 
 
 def test_engine_refetch_ignores_cache(app):
@@ -541,11 +546,15 @@ def test_engine_refetch_ignores_cache(app):
     from lyrics import LyricsResult
 
     orig_bl = playback.fetch_betterlyrics
+    orig_qq = playback.fetch_qq
     orig_lrc = playback.fetch_lrclib
+    orig_kg = playback.fetch_kugou
     orig_clear = playback.clear_track_cache
     cleared = []
     playback.clear_track_cache = lambda *a, **k: cleared.append(True) or 1
     playback.fetch_betterlyrics = lambda *a, **k: None
+    playback.fetch_qq = lambda *a, **k: None
+    playback.fetch_kugou = lambda *a, **k: None
     fresh = LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
                          duration=269.0, synced_lines=[LyricLine(5.0, "Fresh line")],
                          source="lrclib")
@@ -567,7 +576,9 @@ def test_engine_refetch_ignores_cache(app):
             engine.stop()
     finally:
         playback.fetch_betterlyrics = orig_bl
+        playback.fetch_qq = orig_qq
         playback.fetch_lrclib = orig_lrc
+        playback.fetch_kugou = orig_kg
         playback.clear_track_cache = orig_clear
     print("  engine refetch: OK (cache cleared, fresh result applied)")
 

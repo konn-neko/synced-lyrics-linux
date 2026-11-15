@@ -24,8 +24,10 @@ from lyrics import (
     clear_track_cache,
     demo_result,
     fetch_betterlyrics,
+    fetch_kugou,
     fetch_lrclib,
-    search_lrclib,
+    fetch_qq,
+    search_all_candidates,
 )
 
 
@@ -91,14 +93,20 @@ class _LyricsWorker(QObject):
                 # failed re-pull can't leave the wrong ones in place.
                 clear_track_cache(artist, track, album, duration)
             # Provider order: Better Lyrics TTML (word sync) first,
-            # LRCLIB line sync as fallback. fetch_betterlyrics returns
-            # None on 401 (uncached, no key) / 429 / network error —
-            # the track never fails for it, it just falls back.
+            # then QQ QRC (word sync), LRCLIB, then Kugou (line sync).
+            # A provider returning None just falls through to the next
+            # — the track never fails for one provider.
             result = fetch_betterlyrics(artist, track, album, duration,
                                         use_cache=not force)
             if result is None:
+                result = fetch_qq(artist, track, album, duration,
+                                  use_cache=not force)
+            if result is None:
                 result = fetch_lrclib(artist, track, album, duration,
                                       use_cache=not force)
+            if result is None:
+                result = fetch_kugou(artist, track, album, duration,
+                                     use_cache=not force)
             self.result_ready.emit((key, result))
         except LRCLIBRateLimited as e:
             self.result_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -106,9 +114,9 @@ class _LyricsWorker(QObject):
             self.result_ready.emit((key, ("error", str(e))))
 
     def search(self, artist, track, album, duration, key):
-        """LRCLIB search for the Choose-lyrics picker (all matches)."""
+        """All lyric candidates for the picker (all providers)."""
         try:
-            results = search_lrclib(artist, track, album, duration)
+            results = search_all_candidates(artist, track, album, duration)
             self.search_ready.emit((key, results))
         except LRCLIBRateLimited as e:
             self.search_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -290,28 +298,26 @@ class PlaybackEngine(QObject):
         self.lyrics = result
         self.lyrics_changed.emit(result)
         if result is None:
-            self.status_changed.emit("No lyrics found (Better Lyrics + LRCLIB) for this track")
+            self.status_changed.emit("No lyrics found (Better Lyrics + QQ + LRCLIB + Kugou) for this track")
         elif result.instrumental:
             self.status_changed.emit("Instrumental — no lyrics (LRCLIB)")
         elif result.has_synced:
-            if result.has_word_sync:
-                provider = ("Better Lyrics" if result.source.startswith("betterlyrics")
-                            else "LRCLIB")
-                self.status_changed.emit(
-                    f"Word-synced lyrics from {provider} ({len(result.synced_lines)} lines)"
-                    + (" [cached]" if "cache" in result.source else ""))
-            elif result.source.startswith("betterlyrics"):
-                self.status_changed.emit(
-                    f"Synced lyrics from Better Lyrics ({len(result.synced_lines)} lines)"
-                    + (" [cached]" if "cache" in result.source else ""))
+            if result.source.startswith("betterlyrics"):
+                provider = "Better Lyrics"
+            elif result.source.startswith("qq"):
+                provider = "QQ Music"
+            elif result.source.startswith("kugou"):
+                provider = "Kugou"
             else:
-                self.status_changed.emit(
-                    f"Synced lyrics from LRCLIB ({len(result.synced_lines)} lines)"
-                    + (" [cached]" if result.source == "cache" else ""))
+                provider = "LRCLIB"
+            sync = "Word-synced" if result.has_word_sync else "Synced"
+            cached = " [cached]" if "cache" in result.source else ""
+            self.status_changed.emit(
+                f"{sync} lyrics from {provider} ({len(result.synced_lines)} lines){cached}")
         elif result.plain_lyrics:
             self.status_changed.emit("Plain lyrics only — no sync data")
         else:
-            self.status_changed.emit("No lyrics found (Better Lyrics + LRCLIB) for this track")
+            self.status_changed.emit("No lyrics found (Better Lyrics + QQ + LRCLIB + Kugou) for this track")
         self._emit_position()
 
     def current_position(self) -> float:
@@ -405,10 +411,18 @@ class PlaybackEngine(QObject):
         flags = ("word-synced" if result.has_word_sync else
                  "synced" if result.has_synced else
                  "plain" if result.plain_lyrics else "no lyrics")
+        if result.source.startswith("betterlyrics"):
+            provider = "Better Lyrics"
+        elif result.source.startswith("qq"):
+            provider = "QQ Music"
+        elif result.source.startswith("kugou"):
+            provider = "Kugou"
+        else:
+            provider = "LRCLIB"
         self.status_changed.emit(
             f"Using lyrics: {result.artist} — {result.track}"
             + (f" ({result.album})" if result.album else "")
-            + f" — LRCLIB search, {flags}")
+            + f" — {provider}, {flags}")
         self._emit_position()
 
     # ------------------------------------------------------------- controls

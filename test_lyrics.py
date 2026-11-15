@@ -8,12 +8,15 @@ the suite for lack of network, it prints SKIP instead.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import lyrics as _lyrics_module  # noqa: E402  (for monkeypatching providers)
 
 from lyrics import (  # noqa: E402
     LyricsResult,
@@ -23,11 +26,15 @@ from lyrics import (  # noqa: E402
     cache_lrclib_record,
     clear_track_cache,
     fetch_betterlyrics,
+    fetch_kugou,
     fetch_lrclib,
+    fetch_qq,
     log_request,
     parse_lrc,
+    parse_qrc,
     parse_ttml,
     request_log_text,
+    search_all_candidates,
     search_lrclib,
 )
 
@@ -282,6 +289,137 @@ def test_live_lrclib_search():
     return "pass"
 
 
+_QRC_FIXTURE = """[ti:Yellow]
+[ar:Coldplay]
+[al:The Singles 1999-2006]
+[by:]
+[offset:0]
+[0,8390]Yellow(0,2961) (2961,493)-(3454,494) (3948,493)Coldplay(4441,3949)
+[33580,2120]Look (33580,290)at (33870,290)the (34160,290)stars(34450,1250)
+[36300,3909]Look (36300,300)how (36600,319)they (36919,360)shine (37279,650)for (37929,1200)you(39129,1080)
+"""
+
+
+def test_parse_qrc_word_timings():
+    """QRC: line header [startMs,durMs], word(text) after each word."""
+    lines = parse_qrc(_QRC_FIXTURE)
+    assert len(lines) == 3, f"expected 3 lines, got {len(lines)}"
+    first = lines[0]
+    assert first.time == 0.0 and first.text == "Yellow - Coldplay"
+    got = [(w.text, round(w.time, 3), round(w.end, 3)) for w in first.words]
+    assert got == [("Yellow", 0.0, 2.961), ("-", 3.454, 3.948),
+                   ("Coldplay", 4.441, 8.39)], got
+    second = lines[1]
+    assert second.time == 33.58 and second.text == "Look at the stars"
+    assert [w.text for w in second.words] == ["Look", "at", "the", "stars"]
+    assert second.words[3].time == 34.45 and second.words[3].end == 35.70
+    assert second.words[0].parts[0].text == "Look"  # sweep runs the word
+    third = lines[2]
+    assert third.text == "Look how they shine for you"
+    assert third.words[-1].text == "you" and abs(third.words[-1].end - 40.209) < 0.001
+    print("  parse_qrc: OK (3 lines, word timings, whitespace separators skipped)")
+
+
+def test_parse_qrc_xml_wrapper():
+    """QRC inside the QrcInfos XML: LyricContent is extracted with its
+    newlines intact (an XML parser would normalize them to spaces)."""
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n<QrcInfos>\n'
+           '<QrcHeadInfo SaveTime="1421999193" Version="100"/>\n'
+           '<LyricInfo LyricCount="1">\n'
+           '<Lyric_1 LyricType="1" LyricContent="'
+           + _QRC_FIXTURE.replace('"', "&quot;").replace("\n", "&#10;")
+           + '"/>\n</LyricInfo>\n</QrcInfos>')
+    lines = parse_qrc(xml)
+    assert len(lines) == 3, f"expected 3 lines from XML, got {len(lines)}"
+    assert lines[1].text == "Look at the stars"
+    print("  parse_qrc XML: OK (LyricContent extracted, newlines kept)")
+
+
+def test_qq_cache_roundtrip():
+    """A cached QQ result reloads with word timings, no network."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        from lyrics import _cache_path, _qq_cache_key
+        p = _cache_path(cache, _qq_cache_key("Coldplay", "Yellow", "Parachutes", 269.0))
+        p.write_text(json.dumps({"qrc": _QRC_FIXTURE, "fetched_at": 0.0}),
+                     encoding="utf-8")
+        result = fetch_qq("Coldplay", "Yellow", "Parachutes", 269.0,
+                          cache_dir=cache)
+        assert result is not None and result.source == "qq-cache"
+        assert result.has_word_sync
+        assert result.synced_lines[1].text == "Look at the stars"
+        assert result.raw_kind == "qrc"
+    print("  qq cache round-trip: OK")
+
+
+def test_search_all_candidates_merges():
+    """Picker merge: word-synced first (TTML, QQ, word-tagged LRCLIB),
+    then synced, then plain — a provider returning None adds nothing."""
+    def _res(source, synced=True, word=False, track="Yellow"):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
+        return LyricsResult(artist="Coldplay", track=track, album="Parachutes",
+                            duration=269.0, synced_lines=[line] if synced else [],
+                            plain_lyrics="" if synced else "plain words",
+                            source=source)
+
+    orig = {name: getattr(_lyrics_module, name) for name in
+            ("fetch_betterlyrics", "fetch_qq", "fetch_kugou", "search_lrclib")}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", word=True)
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", word=True)
+        _lyrics_module.fetch_kugou = lambda *a, **k: None  # no match: adds nothing
+        _lyrics_module.search_lrclib = lambda *a, **k: [
+            _res("search", word=True, track="Yellow (live)"),
+            _res("search", word=False, track="Yellow (demo)")]
+        results = search_all_candidates("Coldplay", "Yellow", "Parachutes", 269.0)
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    assert [r.source for r in results] == [
+        "betterlyrics", "qq", "search", "search"], [r.source for r in results]
+    assert results[0].has_word_sync and results[1].has_word_sync
+    assert results[2].has_word_sync and not results[3].has_word_sync
+    print("  search_all_candidates: OK (TTML, QQ, LRCLIB word, LRCLIB line)")
+
+
+def test_live_qq_fetch():
+    """Live check: Coldplay — Yellow via QQ returns word-synced QRC.
+    Skipped when offline or when QQ has no match."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = fetch_qq("Coldplay", "Yellow", "Parachutes", 269.0,
+                              cache_dir=Path(tmp))
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live QQ test (offline: {e})")
+        return "skip"
+    if result is None:
+        print("  SKIP live QQ test (no match)")
+        return "skip"
+    assert result.has_word_sync, "QQ match had no word timings"
+    assert len(result.synced_lines) >= 10, f"only {len(result.synced_lines)} lines"
+    print(f"  live QQ: {len(result.synced_lines)} lines, word-synced, source={result.source}")
+    return "pass"
+
+
+def test_live_kugou_fetch():
+    """Live check: Coldplay — Yellow via Kugou returns line-synced LRC.
+    Skipped when offline or when Kugou has no match."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = fetch_kugou("Coldplay", "Yellow", "Parachutes", 269.0,
+                                 cache_dir=Path(tmp))
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live Kugou test (offline: {e})")
+        return "skip"
+    if result is None:
+        print("  SKIP live Kugou test (no match)")
+        return "skip"
+    assert result.has_synced, "Kugou match had no synced lyrics"
+    print(f"  live Kugou: {len(result.synced_lines)} lines, source={result.source}")
+    return "pass"
+
+
 def test_live_betterlyrics_fetch():
     """Live check: Coldplay — Yellow via the Better Lyrics API should
     come back as TTML with word timings. A None result (401: song not
@@ -339,6 +477,12 @@ TESTS = [
     test_request_log,
     test_cache_roundtrip_keeps_word_tags,
     test_clear_track_cache,
+    test_parse_qrc_word_timings,
+    test_parse_qrc_xml_wrapper,
+    test_qq_cache_roundtrip,
+    test_search_all_candidates_merges,
+    test_live_qq_fetch,
+    test_live_kugou_fetch,
     test_live_lrclib_search,
     test_out_of_order_lines_sorted,
     test_line_at_with_offset,

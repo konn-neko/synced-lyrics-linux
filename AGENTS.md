@@ -232,23 +232,41 @@ no login, no API keys.
   the word HTML (tests + fallback).
 - Lyrics picker + re-pull: when several versions match a track, **Lyrics
   > Choose lyrics…** (also in the overlay right-click menu and the tray
-  menu) searches LRCLIB and lists every match — word-synced first, each
-  with artist, album, duration and sync flags — and the pick applies
-  immediately. The pick is cached verbatim under the current track's
-  key (`cache_lrclib_record`), so the next lookup loads it directly.
-  **Lyrics > Re-fetch lyrics (ignore cache)** drops both cache files
-  for the track (`clear_track_cache`) and pulls fresh (Better Lyrics,
-  then LRCLIB) — for when the cached lyrics are wrong. Worker side:
-  `_LyricsWorker.search` + `PlaybackEngine.search_lyrics_candidates` /
-  `apply_candidate` / `refetch_lyrics` (fetch takes `force`, which
-  passes `use_cache=False`). Side fix in the same round: the LRCLIB
-  cache write used to rebuild syncedLyrics from parsed lines, which
-  dropped Enhanced-LRC word tags — a cached track lost word sync on
-  reload. It now caches the raw record verbatim.
+  menu) searches every provider and lists every match — word-synced
+  first, each with artist, album, duration, sync flags and provider —
+  and the pick applies immediately. The pick is cached verbatim under
+  the current track's key (`cache_lrclib_record`), so the next lookup
+  loads it directly. **Lyrics > Re-fetch lyrics (ignore cache)** drops
+  all four cache files for the track (`clear_track_cache`: bl-, qq-,
+  kg-, lrclib) and pulls fresh — for when the cached lyrics are wrong.
+  Worker side: `_LyricsWorker.search` calls `search_all_candidates`
+  and `PlaybackEngine.search_lyrics_candidates` / `apply_candidate` /
+  `refetch_lyrics` (fetch takes `force`, which passes `use_cache=False`).
+  Side fix in the same round: the LRCLIB cache write used to rebuild
+  syncedLyrics from parsed lines, which dropped Enhanced-LRC word
+  tags — a cached track lost word sync on reload. It now caches the
+  raw record verbatim.
+- Word-sync sources: four providers, no keys, no logins. **Better
+  Lyrics TTML** (`/getLyrics`, syllable-level) is first; **QQ Music
+  QRC** (`/qq/getLyrics`, word-level, `parse_qrc` — line `[startMs,
+  durMs]`, word timing follows the word text, whitespace-only
+  segments are separators) is second; **LRCLIB** (line-level, some
+  records Enhanced-LRC word tags) third; **Kugou** (`/kugou/getLyrics`,
+  line-level LRC only) last. Auto-fetch tries them in that order;
+  the picker (`search_all_candidates`) merges all four and sorts
+  word-synced first, provider order within each rank. Caches:
+  `bl-<key>.json` (TTML), `qq-<key>.json` (QRC), `kg-<key>.json`
+  (LRC), `<key>.json` (LRCLIB record). `clear_track_cache` removes
+  all four. Gotcha: QRC's LyricContent must be pulled from the raw
+  XML with a regex — an XML parser normalizes its newlines to
+  spaces and merges every line into one. Musixmatch (needs an API
+  key) and Apple Music (needs a developer token) are NOT viable
+  under the no-keys rule, so they are not wired in.
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
-  + LRCLIB, via `log_request(url, status, body)` in `_get_json` and
-  `fetch_betterlyrics`; album-art fetches in `synced_lyrics.py`
-  `_load_art` log too) — last 20, bodies capped at 200k chars.
+  + LRCLIB + QQ + Kugou, via `log_request(url, status, body)` in
+  `_get_json`, `fetch_betterlyrics` and `_fetch_betterlyrics_provider`;
+  album-art fetches in `synced_lyrics.py` `_load_art` log too) —
+  last 20, bodies capped at 200k chars.
   `LyricsResult` carries `raw_text` / `raw_kind` (the raw TTML or LRC
   exactly as received) and `cache_file`. Help > Lyrics debug
   (`LyricsDebugDialog`, also in the overlay right-click menu, via

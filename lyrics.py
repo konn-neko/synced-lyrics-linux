@@ -4,10 +4,15 @@ Providers, in order:
   1. Better Lyrics API (https://api.betterlyrics.org) — TTML with
      syllable/word-level timing. Cache-first, no API key: cached songs
      are free, a cache miss without a key returns 401 and we fall back
-     to LRCLIB (never fail the track for it).
-  2. LRCLIB (https://lrclib.net) — free, no key. Line-level LRC.
+     (never fail the track for it).
+  2. Better Lyrics QQ provider (/qq/getLyrics) — QRC, word-level
+     timing (QQ Music). Same cache-first, no-key terms as TTML.
+  3. LRCLIB (https://lrclib.net) — free, no key. Line-level LRC,
+     some records carry Enhanced-LRC word tags.
      GET /api/get?artist_name=&track_name=&album_name=&duration=
      GET /api/search?q=
+  4. Better Lyrics Kugou provider (/kugou/getLyrics) — line-level
+     LRC. Last resort when LRCLIB has nothing.
 Responses carry plainLyrics, syncedLyrics (LRC), instrumental, duration.
 Rate limits: ~45 req/min generic, ~90/min identified (Lrclib-Client header).
 429 responses carry a Retry-After header -- we honour it and cache nothing.
@@ -15,6 +20,7 @@ Rate limits: ~45 req/min generic, ~90/min identified (Lrclib-Client header).
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import time
@@ -401,8 +407,306 @@ def parse_ttml(text: str) -> list[LyricLine]:
     return lines
 
 
+# ------------------------------------------------------------------- QRC ---
+_QRC_LINE_RE = re.compile(r"^\[(\d+),(\d+)\](.*)$")
+_QRC_WORD_RE = re.compile(r"(.+?)\((\d+),(\d+)\)")
+
+
+def parse_qrc(text: str) -> list[LyricLine]:
+    """Parse QQ Music QRC (word-level) into [LyricLine].
+
+    Accepts the raw LyricContent string or the full QrcInfos XML (the
+    LyricContent attribute is extracted first; LyricType 1 preferred).
+    Each line is `[startMs,durationMs]` followed by
+    `word(startMs,durationMs)` segments — the timing follows the word
+    text, and a segment that is only whitespace is the separator
+    between two words, not a word. Times are milliseconds. Metadata
+    lines ([ti:], [ar:] ...) have no [start,duration] header and are
+    skipped. Word ends come from the QRC durations (not inferred).
+    """
+    if not text:
+        return []
+    content = text
+    if "<QrcInfos" in text or "<Lyric_" in text:
+        # Extract LyricContent from the raw XML string with a regex:
+        # an XML parser would normalize the newlines inside the
+        # attribute value to spaces (attribute-value normalization),
+        # merging every lyric line into one. The regex keeps them.
+        m = re.search(r'LyricContent="(.*?)"', text, re.DOTALL)
+        if m:
+            content = html.unescape(m.group(1))
+        else:
+            # Fallback: parse the XML and take the first Lyric_*.
+            try:
+                root = ET.fromstring(text)
+                lyric = None
+                for elem in root.iter():
+                    tag = elem.tag.rsplit("}", 1)[-1]
+                    if tag.startswith("Lyric_"):
+                        if lyric is None:
+                            lyric = elem
+                        if elem.get("LyricType") == "1":
+                            lyric = elem
+                            break
+                if lyric is not None:
+                    content = lyric.get("LyricContent") or ""
+            except ET.ParseError:
+                pass
+    lines: list[LyricLine] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _QRC_LINE_RE.match(line)
+        if not m:
+            continue
+        start_ms = int(m.group(1))
+        body = m.group(3)
+        words: list[LyricWord] = []
+        for wm in _QRC_WORD_RE.finditer(body):
+            wtext = wm.group(1).strip()
+            if not wtext:
+                continue  # whitespace-only segment: word separator
+            wstart = int(wm.group(2)) / 1000.0
+            wend = wstart + int(wm.group(3)) / 1000.0
+            w = LyricWord(time=wstart, end=wend, text=wtext)
+            w.parts = [LyricWord(time=wstart, end=wend, text=wtext)]
+            words.append(w)
+        if not words:
+            continue
+        lines.append(LyricLine(time=start_ms / 1000.0,
+                               text=" ".join(w.text for w in words),
+                               words=words))
+    lines.sort(key=lambda l: l.time)
+    return lines
+
+
 def _betterlyrics_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
     return "bl-" + _cache_key(artist, track, album, duration)
+
+
+def _qq_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
+    return "qq-" + _cache_key(artist, track, album, duration)
+
+
+def _kg_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
+    return "kg-" + _cache_key(artist, track, album, duration)
+
+
+def _fetch_betterlyrics_provider(
+    provider: str,
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> dict | None:
+    """One GET to a Better Lyrics provider endpoint (/qq, /kugou...).
+
+    Returns the parsed JSON payload, or None on 401/429/network error
+    (the caller falls through to the next provider — never fail the
+    track for one provider). Every request is logged for the debug view.
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    params = {"s": track, "a": artist}
+    if album:
+        params["al"] = album
+    if duration is not None:
+        params["d"] = str(int(round(duration)))
+    url = (f"{BETTERLYRICS_BASE}/{provider}/getLyrics?"
+           f"{urllib.parse.urlencode(params)}")
+    req = urllib.request.Request(
+        url, headers={"User-Agent": CLIENT_HEADER, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            raw = resp.read().decode("utf-8")
+            log_request(url, f"HTTP {resp.status}", raw)
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        log_request(url, f"HTTP {e.code}", body)
+        return None
+    except Exception as e:
+        log_request(url, "network error", str(e))
+        return None
+
+
+def fetch_qq(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> LyricsResult | None:
+    """Fetch word-synced lyrics from QQ Music via Better Lyrics (/qq).
+
+    The response carries QRC XML — word-level timings, like TTML but
+    from QQ. Cache-first, no key (same terms as the TTML endpoint).
+    Returns None when QQ has no match for the track.
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _qq_cache_key(artist, track, album, duration)
+
+    def _from_qrc(qrc: str, source: str) -> LyricsResult | None:
+        lines = parse_qrc(qrc)
+        if not lines:
+            return None
+        return LyricsResult(
+            artist=artist, track=track, album=album, duration=duration,
+            synced_lines=lines, source=source, raw_text=qrc, raw_kind="qrc",
+            cache_file=str(_cache_path(cache, key)))
+
+    if use_cache:
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = _from_qrc(data.get("qrc") or "", "qq-cache")
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # corrupt cache: fall through to network
+
+    payload = _fetch_betterlyrics_provider("qq", artist, track, album, duration)
+    if payload is None:
+        return None
+    qrc = payload.get("lyrics") or ""
+    if not qrc:
+        return None
+    result = _from_qrc(qrc, "qq")
+    if result is None:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        _cache_path(cache, key).write_text(
+            json.dumps({"qrc": qrc, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def fetch_kugou(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> LyricsResult | None:
+    """Fetch line-synced lyrics from Kugou via Better Lyrics (/kugou).
+
+    Kugou's endpoint returns plain line-level LRC (no word tags) —
+    it is a coverage fallback for songs LRCLIB lacks, not a word-sync
+    source. Cache-first, no key. Returns None when Kugou has no match.
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _kg_cache_key(artist, track, album, duration)
+
+    def _from_lrc(lrc: str, source: str) -> LyricsResult | None:
+        lines = parse_lrc(lrc)
+        if not lines:
+            return None
+        return LyricsResult(
+            artist=artist, track=track, album=album, duration=duration,
+            synced_lines=lines, source=source, raw_text=lrc, raw_kind="lrc",
+            cache_file=str(_cache_path(cache, key)))
+
+    if use_cache:
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = _from_lrc(data.get("lrc") or "", "kugou-cache")
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # corrupt cache: fall through to network
+
+    payload = _fetch_betterlyrics_provider("kugou", artist, track, album, duration)
+    if payload is None:
+        return None
+    lrc = payload.get("lyrics") or ""
+    if not lrc:
+        return None
+    result = _from_lrc(lrc, "kugou")
+    if result is None:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        _cache_path(cache, key).write_text(
+            json.dumps({"lrc": lrc, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def search_all_candidates(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+) -> list[LyricsResult]:
+    """All lyric candidates for the picker, word-synced first.
+
+    Better Lyrics TTML (single best match) + QQ QRC (word-level) +
+    Kugou LRC + LRCLIB search results. Each provider is best-effort:
+    one returning None just contributes nothing. Sorted: word-synced
+    first (TTML, then QQ, then word-tagged LRCLIB), then synced,
+    then plain-only — provider order kept within each rank.
+    """
+    candidates: list[LyricsResult] = []
+    for fn in (fetch_betterlyrics, fetch_qq, fetch_kugou):
+        try:
+            result = fn(artist, track, album, duration)
+        except Exception:
+            result = None
+        if result is not None and (result.has_synced or result.plain_lyrics
+                                   or result.instrumental):
+            candidates.append(result)
+    try:
+        candidates.extend(search_lrclib(artist, track, album, duration))
+    except Exception:
+        pass
+
+    def _provider_rank(r: LyricsResult) -> int:
+        if r.source.startswith("betterlyrics"):
+            return 0
+        if r.source.startswith("qq"):
+            return 1
+        if r.source == "search":
+            return 2
+        return 3
+
+    def _rank(r: LyricsResult):
+        sync = 0 if r.has_word_sync else (1 if r.has_synced else 2)
+        return (sync, _provider_rank(r))
+
+    candidates.sort(key=_rank)
+    return candidates
 
 
 def fetch_betterlyrics(
@@ -595,7 +899,8 @@ def clear_track_cache(
     duration: float | None = None,
     cache_dir: Path | None = None,
 ) -> int:
-    """Delete both cache files for a track (Better Lyrics + LRCLIB).
+    """Delete all cache files for a track (Better Lyrics TTML + QQ +
+    Kugou + LRCLIB).
 
     Used by a forced re-pull: the cached lyrics were wrong, so they
     must not survive a failed re-fetch either. Returns how many files
@@ -605,6 +910,8 @@ def clear_track_cache(
     cache = cache_dir or DEFAULT_CACHE_DIR
     removed = 0
     for key in (_betterlyrics_cache_key(artist, track, album, duration),
+                _qq_cache_key(artist, track, album, duration),
+                _kg_cache_key(artist, track, album, duration),
                 _cache_key(artist, track, album, duration)):
         try:
             p = _cache_path(cache, key)

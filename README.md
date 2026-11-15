@@ -11,9 +11,10 @@
 BetterLyrics is Windows-only (WinUI 3, Windows Media Transport Controls).
 On Linux the same job is actually easier: every player already publishes
 what's playing over **MPRIS**, and **Better Lyrics** serves word-synced
-lyrics (TTML, cache-first, no key) with **LRCLIB** as the line-sync
-fallback. This app glues those together in a native Qt6 window — no
-Electron, no account, no API key.
+lyrics (TTML, cache-first, no key) — plus its QQ provider (QRC,
+word-level) — with **LRCLIB** and Kugou as line-sync fallbacks. This
+app glues those together in a native Qt6 window — no Electron, no
+account, no API key.
 
 ## Screenshots
 
@@ -49,10 +50,12 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   effect on the sample lyrics.
 - **Choose lyrics** — if several versions of a song exist, `Lyrics >
   Choose lyrics…` (also in the Overlay menu and the tray menu) lists
-  every LRCLIB match — word-synced first — and the pick applies
-  immediately and sticks for that track. `Lyrics > Re-fetch lyrics
-  (ignore cache)` drops the cached lyrics and pulls fresh, for when
-  the cache has the wrong version.
+  every match from all four providers — Better Lyrics (syllable-sync),
+  QQ Music (word-sync), LRCLIB and Kugou — word-synced first, each
+  labelled with its provider, and the pick applies immediately and
+  sticks for that track. `Lyrics > Re-fetch lyrics (ignore cache)`
+  drops the cached lyrics and pulls fresh, for when the cache has
+  the wrong version.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay
   right-click menu) shows the raw lyrics file exactly as received
   plus every URL query the app made this run with its response, so
@@ -182,8 +185,10 @@ PlaybackEngine  (one poller, 250 ms, position interpolated
         │       with a monotonic clock between polls)
         ├─► Better Lyrics  GET /getLyrics?s=&a=&al=&d=  (TTML, word sync)
         │           (cache-first, no key; 401/429 → fall back)
+        ├─► QQ Music  GET /qq/getLyrics  (QRC, word sync)
         ├─► LRCLIB  GET /api/get?artist_name=&track_name=&album_name=&duration=
         │           (fallback /api/search; cached in ~/.cache/synced-lyrics-linux/)
+        └─► Kugou  GET /kugou/getLyrics  (LRC, line sync, last resort)
         ▼
 Full App window  ⇄  Overlay window  ⇄  System tray
         (all three render the same engine state)
@@ -199,9 +204,11 @@ Full App window  ⇄  Overlay window  ⇄  System tray
   is what powers word-by-word highlighting. Cache-first and free: songs
   already cached need no API key at all, and this app never sends one.
   A cache miss without a key returns 401 (keys aren't being issued
-  right now) — the app just falls back to LRCLIB instead of failing
-  the track. The Kugou/QQ provider endpoints were checked and are NOT
-  used: they return line-level LRC / QRC, not TTML. Docs:
+  right now) — the app just falls back to the next provider instead
+  of failing the track. The QQ provider (`/qq/getLyrics`) returns
+  QRC, which is also word-level (each word carries its own
+  start/duration in ms); the Kugou provider (`/kugou/getLyrics`)
+  returns line-level LRC only and is the last resort. Docs:
   https://lyrics-api-docs.boidu.dev
 - **LRCLIB:** `https://lrclib.net/api/get` returns `syncedLyrics` (LRC),
   `plainLyrics`, `instrumental`, `duration`. No key; the client sends
@@ -222,7 +229,12 @@ Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Source | Sync level | Key? | When it's used |
 |---|---|---|---|
 | Better Lyrics API (`api.betterlyrics.org`) | Word / syllable (TTML) | No — cache-first, cached songs are free | First, for every track |
-| LRCLIB (`lrclib.net`) | Line (LRC) | No | Fallback when Better Lyrics 401s, 429s, or has no match |
+| QQ Music via Better Lyrics (`/qq/getLyrics`) | Word (QRC) | No — cache-first | Second, when TTML has no match |
+| LRCLIB (`lrclib.net`) | Line (LRC); some records word-tagged | No | Third, when TTML and QQ have no match |
+| Kugou via Better Lyrics (`/kugou/getLyrics`) | Line (LRC) | No — cache-first | Last resort, when nothing else matched |
+
+The picker (`Lyrics > Choose lyrics…`) pulls all four at once and
+lists every match, word-synced first.
 
 The status bar always names the real source, e.g. "Word-synced lyrics
 from Better Lyrics (38 lines)" or "Synced lyrics from LRCLIB (37
