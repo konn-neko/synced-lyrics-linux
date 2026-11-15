@@ -196,6 +196,29 @@ no login, no API keys.
   skipped tick retries on the next 250 ms position tick. Engine side:
   `PlaybackEngine.word_index_at(pos)` → (line_idx, word_idx) from the
   same interpolated position; do not poll faster for words.
+- Mid-word sweep (not word snap): TTML syllable spans are kept as
+  `LyricWord.parts` on each word (`parse_ttml` merges spans into a
+  word but keeps the spans with their own begin/end; ELRC/demo words
+  get parts=[the word itself]). `render_line_html(line, word_idx, pos,
+  offset)` renders the active word as a sweep: completed parts fully
+  sung, the part containing `pos` split character-by-character by the
+  elapsed fraction inside that part, later parts unsung. `pos=None`
+  renders the whole active word sung (the old behaviour). A 60 ms
+  QTimer in each window (`_on_fill_tick`) re-renders the current
+  line's fill from `engine.current_position()` and only calls setText
+  when the HTML actually changed; it never touches MPRIS — it reads
+  the monotonic estimate between 250 ms polls, and line changes still
+  go through `_highlight()` / the overlay crossfade.
+- Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
+  + LRCLIB, via `log_request(url, status, body)` in `_get_json` and
+  `fetch_betterlyrics`; album-art fetches in `synced_lyrics.py`
+  `_load_art` log too) — last 20, bodies capped at 200k chars.
+  `LyricsResult` carries `raw_text` / `raw_kind` (the raw TTML or LRC
+  exactly as received) and `cache_file`. Help > Lyrics debug
+  (`LyricsDebugDialog`, also in the overlay right-click menu, via
+  `AppController.show_lyrics_debug`) shows `build_lyrics_debug_text`
+  (track, source, raw file, request log) in a monospace read-only
+  view with Copy all. Never commit cached lyrics or raw TTML.
 - Single instance: `main()` takes a `QLockFile` at
   `~/.config/synced-lyrics-linux/synced-lyrics.lock` (held on the app
   object for the run; `tryLock(0)` — PySide6 requires the timeout arg;

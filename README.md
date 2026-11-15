@@ -37,9 +37,16 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   `"line_animations": false` in the config) for the old instant swap.
 - **Word-by-word karaoke** — when a track has word timings, words
   light up one by one in crimson as they're sung (Full App list and
-  Overlay alike), instead of the whole line flipping at once. Tracks
-  without word timings fall back to line-only highlighting, exactly
-  as before. `--demo` shows the effect on the sample lyrics.
+  Overlay alike), instead of the whole line flipping at once. Better
+  Lyrics TTML carries syllable timings too, so the colour washes
+  across a word mid-word, syllable by syllable, instead of the whole
+  word snapping at once. Tracks without word timings fall back to
+  line-only highlighting, exactly as before. `--demo` shows the
+  effect on the sample lyrics.
+- **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay
+  right-click menu) shows the raw lyrics file exactly as received
+  plus every URL query the app made this run with its response, so
+  you can see what the APIs actually returned.
 - **Overlay mode** — frameless, always-on-top, translucent. Shows the
   current line large + the next line dimmed, with track title/artist and
   play/pause controls. Lines crossfade on change (~150ms out, ~250ms in)

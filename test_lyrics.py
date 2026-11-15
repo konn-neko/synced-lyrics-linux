@@ -19,10 +19,13 @@ from lyrics import (  # noqa: E402
     LyricsResult,
     LyricLine,
     LyricWord,
+    _REQUEST_LOG,
     fetch_betterlyrics,
     fetch_lrclib,
+    log_request,
     parse_lrc,
     parse_ttml,
+    request_log_text,
 )
 
 
@@ -140,6 +143,66 @@ def test_parse_ttml_time_formats_and_bg():
     assert parse_ttml("") == []
 
 
+def test_parse_ttml_syllable_parts():
+    """TTML spans with no whitespace between them merge into one word
+    but KEEP their own timings as parts — the mid-word sweep needs
+    them. A word split as 'Vir-' + 'tual' is one word, two parts."""
+    ttml = """<tt xmlns="http://www.w3.org/ns/ttml"><body><div>
+<p begin="1.050" end="2.500"><span begin="1.050" end="1.390">Vir-</span><span begin="1.390" end="1.710">tual </span><span begin="1.710" end="2.140">Insanity</span></p>
+</div></body></tt>"""
+    lines = parse_ttml(ttml)
+    assert len(lines) == 1, lines
+    # The hyphen lives in the first span's text, so the joined word
+    # is "Vir-tual" — the parser concatenates spans, it doesn't
+    # invent a spelling.
+    assert lines[0].text == "Vir-tual Insanity"
+    assert len(lines[0].words) == 2, lines[0].words
+    word = lines[0].words[0]
+    assert word.text == "Vir-tual"
+    assert len(word.parts) == 2, word.parts
+    assert word.parts[0].text == "Vir-"
+    assert abs(word.parts[0].time - 1.050) < 0.001
+    assert abs(word.parts[0].end - 1.390) < 0.001
+    assert word.parts[1].text == "tual"
+    assert abs(word.parts[1].time - 1.390) < 0.001
+    assert abs(word.parts[1].end - 1.710) < 0.001
+    # Second word is a single span: one part — itself.
+    assert len(lines[0].words[1].parts) == 1
+    assert lines[0].words[1].parts[0].text == "Insanity"
+
+
+def test_elrc_word_parts():
+    """Enhanced-LRC words carry parts=[the word itself], so the sweep
+    runs across the whole word (his Jamiroquai file's format)."""
+    lines = parse_lrc(
+        "[00:01.050]<00:01.050>Virtual <00:01.390>Insanity <00:01.710>- "
+        "<00:02.140>Jamiroquai\n")
+    assert len(lines) == 1, lines
+    assert len(lines[0].words) == 4, lines[0].words
+    for w in lines[0].words:
+        assert len(w.parts) == 1, w
+        assert w.parts[0].text == w.text
+        assert w.parts[0].time == w.time
+        assert w.parts[0].end == w.end
+
+
+def test_request_log():
+    """log_request records URL + status + body; the log caps at 20."""
+    _REQUEST_LOG.clear()
+    log_request("https://example.test/a", "HTTP 200", "body-a")
+    log_request("https://example.test/b", "HTTP 401", "body-b")
+    text = request_log_text()
+    assert "https://example.test/a" in text
+    assert "HTTP 200" in text and "body-a" in text
+    assert "HTTP 401" in text and "body-b" in text
+    for i in range(25):
+        log_request(f"https://example.test/{i}", "HTTP 200", "x")
+    assert len(_REQUEST_LOG) == 20, len(_REQUEST_LOG)
+    assert "https://example.test/a" not in request_log_text()
+    _REQUEST_LOG.clear()
+    assert request_log_text() == "(no HTTP requests yet this run)"
+
+
 def test_out_of_order_lines_sorted():
     lines = parse_lrc("[00:20.00] Second\n[00:10.00] First\n")
     assert [l.text for l in lines] == ["First", "Second"]
@@ -208,6 +271,9 @@ TESTS = [
     test_word_at_and_has_word_sync,
     test_parse_ttml_docs_example,
     test_parse_ttml_time_formats_and_bg,
+    test_parse_ttml_syllable_parts,
+    test_elrc_word_parts,
+    test_request_log,
     test_out_of_order_lines_sorted,
     test_line_at_with_offset,
     test_live_betterlyrics_fetch,

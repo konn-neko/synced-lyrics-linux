@@ -17,6 +17,7 @@ construct headlessly, so the helpers are tested directly and the
 --demo smoke run exercises the windows end to end.
 """
 import os
+import re
 import sys
 import tempfile
 import time as _time
@@ -29,7 +30,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView, QApplication, QLabel, QListWidget, QListWidgetItem,
-    QScrollBar, QWidget,
+    QScrollBar, QTextEdit, QWidget,
 )
 
 from lyrics import LyricLine, LyricWord, LyricsResult  # noqa: E402
@@ -41,6 +42,7 @@ from synced_lyrics import (  # noqa: E402
     SmoothScroller,
     _lerp_color,
     build_display_menu,
+    build_lyrics_debug_text,
     render_line_html,
 )
 
@@ -299,6 +301,71 @@ def test_engine_position_monotonic(app):
     print("  engine position: OK (emitted position monotonic, line idx never flips back)")
 
 
+def _html_spans(html_text):
+    """[(color, text)] for each <span> in render_line_html output."""
+    return [(m.group(1), m.group(2)) for m in re.finditer(
+        r'<span style="color:([^;]+);[^"]*">(.*?)</span>', html_text)]
+
+
+def test_render_line_html_sweep():
+    """Mid-word sweep: the active word lights up part by part as the
+    position moves through it, instead of snapping whole to crimson."""
+    line = LyricLine(1.05, "Virtual Insanity", [
+        LyricWord(1.05, 1.71, "Virtual", parts=[
+            LyricWord(1.05, 1.39, "Vir-"), LyricWord(1.39, 1.71, "tual")]),
+        LyricWord(1.71, 2.14, "Insanity", parts=[
+            LyricWord(1.71, 2.14, "Insanity")])])
+    # pos=None (old behaviour): active word fully sung, one span per part.
+    assert _html_spans(render_line_html(line, 0)) == [
+        ("#FF1A47", "Vir-"), ("#FF1A47", "tual"), ("#8b949e", "Insanity")]
+    # Mid first syllable (1.20, ~44% through "Vir-"): "Vi" sung, rest dim.
+    assert _html_spans(render_line_html(line, 0, 1.20)) == [
+        ("#FF1A47", "Vi"), ("#8b949e", "r-"), ("#8b949e", "tual"),
+        ("#8b949e", "Insanity")]
+    # Mid second syllable (1.55): first part fully sung, "tu" sung, "al" dim.
+    assert _html_spans(render_line_html(line, 0, 1.55)) == [
+        ("#FF1A47", "Vir-"), ("#FF1A47", "tu"), ("#8b949e", "al"),
+        ("#8b949e", "Insanity")]
+    # Before the word starts: everything dim.
+    assert all(c == "#8b949e"
+               for c, _ in _html_spans(render_line_html(line, 0, 0.5)))
+    # Second word active (1.80): first word fully sung (one span —
+    # completed words render whole), "In" sung.
+    assert _html_spans(render_line_html(line, 1, 1.80)) == [
+        ("#FF1A47", "Virtual"), ("#FF1A47", "In"),
+        ("#8b949e", "sanity")]
+    # No parts: the sweep runs across the whole word (5.0-7.0 s).
+    plain = LyricLine(5.0, "stars", [LyricWord(5.0, 7.0, "stars")])
+    assert _html_spans(render_line_html(plain, 0, 6.0)) == [
+        ("#FF1A47", "st"), ("#8b949e", "ars")]
+    print("  render_line_html sweep: OK (syllable split, char split, no-parts word)")
+
+
+def test_lyrics_debug_text(app):
+    """Help > Lyrics debug text: track, source, raw file, request log."""
+    from synced_lyrics import AppController, LyricsDebugDialog
+    controller = AppController(app, demo=True, mode="full", screen_choice=None)
+    try:
+        engine = controller.engine
+        engine._timer.stop()
+        engine._players_timer.stop()
+        text = build_lyrics_debug_text(engine)
+        assert "Coldplay" in text and "Yellow" in text, text
+        assert "Lyrics source: demo" in text, text
+        assert "=== Raw lyrics file (lrc) ===" in text, text
+        assert "[00:05.00] Look at the stars" in text, text
+        assert "=== HTTP requests (this run) ===" in text, text
+        # The dialog itself builds without crashing and shows the text.
+        dlg = LyricsDebugDialog(controller.full, engine)
+        shown = dlg.findChild(QTextEdit).toPlainText()
+        assert "Raw lyrics file" in shown and "Coldplay" in shown
+    finally:
+        engine.stop()
+        controller.full.hide()
+        controller.overlay.hide()
+    print("  lyrics debug text: OK (track, source, raw file, request log, dialog builds)")
+
+
 def test_lyrics_delegate_and_scroll(app):
     """Regression: word HTML must RENDER, and scrolling must be per-pixel.
 
@@ -420,6 +487,8 @@ def main():
     test_single_instance_lock()
     test_local_server_raise(app)
     test_render_line_html()
+    test_render_line_html_sweep()
+    test_lyrics_debug_text(app)
     test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()
     test_engine_position_monotonic(app)

@@ -289,6 +289,18 @@ class PlaybackEngine(QObject):
             self.status_changed.emit("No lyrics found (Better Lyrics + LRCLIB) for this track")
         self._emit_position()
 
+    def current_position(self) -> float:
+        """Interpolated position right now (demo or monotonic estimate).
+
+        Used by the mid-word sweep timers in the windows: they read
+        the estimate ~16x/s instead of waiting for the 250 ms poll.
+        This reads state only — it never polls MPRIS.
+        """
+        if self.demo:
+            return self._demo_pos
+        return self._pos.estimate(
+            time.monotonic(), playing=(self.track.status == "Playing"))
+
     def word_index_at(self, pos: float) -> tuple[int, int]:
         """(line_idx, word_idx) active at `pos` (offset applied).
 

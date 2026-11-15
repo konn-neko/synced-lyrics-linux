@@ -34,15 +34,15 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
     QGraphicsOpacityEffect, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSizeGrip,
     QSlider, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
-    QSystemTrayIcon, QVBoxLayout, QWidget, QWidgetAction,
+    QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 import mpris
-from lyrics import fetch_lrclib
+from lyrics import fetch_lrclib, log_request, request_log_text
 from playback import PlaybackEngine
 
 APP_NAME = "synced-lyrics-linux"
@@ -210,32 +210,81 @@ def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
         round(c1.blue() + (c2.blue() - c1.blue()) * t))
 
 
-def render_line_html(line, word_idx: int,
+def _word_span(text: str, color: str, sung: bool, is_background: bool) -> str:
+    """One HTML span for a piece of text (a word or part of one)."""
+    if not text:
+        return ""
+    style = f"color:{color};"
+    style += "font-weight:bold;" if sung else "font-weight:normal;"
+    if is_background:
+        style += "font-style:italic;"
+    return f'<span style="{style}">{html.escape(text)}</span>'
+
+
+def _render_word_sweep(word, pos: float | None, sung_color: str,
+                       unsung_color: str) -> str:
+    """Render one word with a mid-word sweep at `pos` (offset applied).
+
+    Completed syllable parts are fully sung; the part containing `pos`
+    is split character-by-character by the fraction elapsed inside
+    that part, so the colour washes across the word as it is sung
+    instead of the whole word snapping to crimson at once. Parts
+    without timings sweep across the whole word. `pos=None` renders
+    the whole word sung (the old behaviour).
+    """
+    parts = word.parts or [word]
+    out = []
+    for part in parts:
+        if pos is None or pos >= part.end:
+            out.append(_word_span(part.text, sung_color, True,
+                                  word.is_background))
+        elif pos <= part.time:
+            out.append(_word_span(part.text, unsung_color, False,
+                                  word.is_background))
+        else:
+            dur = max(0.001, part.end - part.time)
+            frac = (pos - part.time) / dur
+            n = int(round(len(part.text) * frac))
+            n = max(0, min(len(part.text), n))
+            out.append(_word_span(part.text[:n], sung_color, True,
+                                  word.is_background))
+            out.append(_word_span(part.text[n:], unsung_color, False,
+                                  word.is_background))
+    return "".join(out)
+
+
+def render_line_html(line, word_idx: int, pos: float | None = None,
+                     offset: float = 0.0,
                      sung_color: str = CRIMSON,
                      unsung_color: str = DIM) -> str:
     """HTML for one lyric line with words up to `word_idx` sung.
 
     Pure helper (no Qt widgets) so tests can cover it without windows.
-    Words 0..word_idx are sung (sung colour, bold); the rest are
-    unsung. Background-vocal words render italic. Lines without word
-    timings return their plain text, HTML-escaped — exactly today's
-    line-only rendering. QLabel renders this rich text natively;
-    QListWidgetItem does NOT (its default delegate shows the tags
-    literally — seen on William's box), so the Full App list paints it
-    with LyricsItemDelegate below.
+    Words before `word_idx` are fully sung; the active word sweeps
+    mid-word when `pos` is given (see _render_word_sweep); the rest
+    are unsung. Background-vocal words render italic. Lines without
+    word timings return their plain text, HTML-escaped — exactly
+    today's line-only rendering. With `pos=None` the active word is
+    fully sung, exactly the old behaviour. QLabel renders this rich
+    text natively; QListWidgetItem does NOT (its default delegate
+    shows the tags literally — seen on William's box), so the Full App
+    list paints it with LyricsItemDelegate below.
     """
     text = html.escape(line.text)
     if not line.words:
         return text
+    eff_pos = None if pos is None else pos + offset
     parts = []
     for i, word in enumerate(line.words):
-        sung = 0 <= word_idx and i <= word_idx
-        color = sung_color if sung else unsung_color
-        style = f"color:{color};"
-        style += "font-weight:bold;" if sung else "font-weight:normal;"
-        if word.is_background:
-            style += "font-style:italic;"
-        parts.append(f'<span style="{style}">{html.escape(word.text)}</span>')
+        if i < word_idx:
+            parts.append(_word_span(word.text, sung_color, True,
+                                    word.is_background))
+        elif i == word_idx:
+            parts.append(_render_word_sweep(word, eff_pos, sung_color,
+                                            unsung_color))
+        else:
+            parts.append(_word_span(word.text, unsung_color, False,
+                                    word.is_background))
     return " ".join(parts)
 
 
@@ -427,6 +476,62 @@ class LyricsViewMixin:
 
 
 # --------------------------------------------------------------- full app
+def build_lyrics_debug_text(engine) -> str:
+    """Plain-text debug dump for Help > Lyrics debug.
+
+    Current track, lyrics source, the raw lyrics file exactly as
+    received, and every HTTP request this run with its response.
+    Pure function (takes the engine) so tests can cover it without
+    opening the dialog.
+    """
+    out = []
+    track = engine.track
+    out.append(f"Track: {track.display or '(nothing playing)'}")
+    out.append(f"Player: {track.player or '-'}   Status: {track.status or '-'}")
+    lyrics = engine.lyrics
+    if lyrics is None:
+        out.append("Lyrics: none loaded")
+    else:
+        n_words = sum(len(l.words) for l in lyrics.synced_lines)
+        out.append(f"Lyrics source: {lyrics.source}")
+        out.append(f"Lines: {len(lyrics.synced_lines)}   Words: {n_words}"
+                   f"   Word sync: {lyrics.has_word_sync}")
+        if lyrics.cache_file:
+            out.append(f"Cache file: {lyrics.cache_file}")
+        out.append("")
+        out.append(f"=== Raw lyrics file ({lyrics.raw_kind or 'unknown'}) ===")
+        out.append(lyrics.raw_text or "(no raw text stored for this result)")
+    out.append("")
+    out.append("=== HTTP requests (this run) ===")
+    out.append(request_log_text())
+    return "\n".join(out)
+
+
+class LyricsDebugDialog(QDialog):
+    """Help > Lyrics debug: raw lyrics file + all URL queries/responses."""
+
+    def __init__(self, parent, engine):
+        super().__init__(parent)
+        self.setWindowTitle("Lyrics debug")
+        self.resize(800, 600)
+        layout = QVBoxLayout(self)
+        text = QTextEdit(self)
+        text.setReadOnly(True)
+        text.setFont(QFont("monospace"))
+        text.setPlainText(build_lyrics_debug_text(engine))
+        layout.addWidget(text)
+        row = QHBoxLayout()
+        copy_btn = QPushButton("Copy all")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(text.toPlainText()))
+        row.addWidget(copy_btn)
+        row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+
 class FullAppWindow(QMainWindow):
     def __init__(self, controller):
         super().__init__()
@@ -563,6 +668,15 @@ class FullAppWindow(QMainWindow):
         self._fade_step = 0
         self._fade_steps = 5  # 5 x 30ms = ~150ms colour crossfade
 
+        # Mid-word sweep: re-render the current line's word fill ~16x/s
+        # from the engine's interpolated position. This is a UI repaint
+        # timer only — it never touches MPRIS (no second poller), it
+        # just reads the monotonic estimate between 250 ms polls.
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setInterval(60)
+        self._fill_timer.timeout.connect(self._on_fill_tick)
+        self._fill_timer.start()
+
         self.statusBar().showMessage("Starting…")
         self._build_menu()
         self._apply_style()
@@ -624,6 +738,10 @@ class FullAppWindow(QMainWindow):
         view_menu.addAction(self.anim_act)
 
         help_menu = menubar.addMenu("&Help")
+        a = QAction("Lyrics debug", self)
+        a.setToolTip("Show the raw lyrics file and every URL query + response")
+        a.triggered.connect(c.show_lyrics_debug)
+        help_menu.addAction(a)
         a = QAction("About", self)
         a.triggered.connect(lambda: QMessageBox.about(
             self, "Synced Lyrics — Linux",
@@ -667,7 +785,10 @@ class FullAppWindow(QMainWindow):
             if not path.exists():
                 req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
                 with urllib.request.urlopen(req, timeout=10) as r:
-                    path.write_bytes(r.read())
+                    data = r.read()
+                    log_request(url, f"HTTP {r.status}",
+                                f"<{len(data)} bytes of image data>")
+                    path.write_bytes(data)
             from PySide6.QtGui import QPixmap as _PM
             pm = _PM(str(path))
             if not pm.isNull():
@@ -801,7 +922,8 @@ class FullAppWindow(QMainWindow):
         """Apply word-by-word HTML to the current line's list item.
 
         Lines without word timings keep their plain text, so line-only
-        tracks render exactly as before.
+        tracks render exactly as before. The active word is rendered
+        with the mid-word sweep at the current interpolated position.
         """
         idx = self._current_idx
         if not (0 <= idx < self.lyrics_list.count()):
@@ -811,7 +933,34 @@ class FullAppWindow(QMainWindow):
             return
         item = self.lyrics_list.item(idx)
         item.setText(render_line_html(
-            lyrics.synced_lines[idx], self._current_word_idx))
+            lyrics.synced_lines[idx], self._current_word_idx,
+            self.engine.current_position(), offset=self.engine.offset))
+
+    def _on_fill_tick(self):
+        """Mid-word sweep: re-render the current line's word fill from
+        the interpolated position, ~16x/s. Only the current line's
+        item text changes, and only when the HTML actually changed,
+        so this is cheap; line changes still go through _highlight().
+        """
+        lyrics = self.engine.lyrics
+        if not lyrics or not lyrics.has_word_sync:
+            return
+        if self.engine.track.status != "Playing":
+            return
+        idx = self._current_idx
+        if not (0 <= idx < self.lyrics_list.count()):
+            return
+        pos = self.engine.current_position()
+        line_idx, word_idx = self.engine.word_index_at(pos)
+        if line_idx != idx:
+            return  # line change: _on_position / _highlight owns it
+        if word_idx != self._current_word_idx:
+            self._current_word_idx = word_idx
+        item = self.lyrics_list.item(idx)
+        html = render_line_html(lyrics.synced_lines[idx], word_idx, pos,
+                                offset=self.engine.offset)
+        if html != item.text():
+            item.setText(html)
 
     def _on_fade_tick(self):
         self._fade_step += 1
@@ -969,6 +1118,14 @@ class OverlayWindow(QWidget):
         self._current_fader = LabelFader(self.current_label)
         self._next_fader = LabelFader(self.next_label)
 
+        # Mid-word sweep: re-render the current line's word fill ~16x/s
+        # from the interpolated position (UI repaint timer only — it
+        # never touches MPRIS, just reads the engine's estimate).
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setInterval(60)
+        self._fill_timer.timeout.connect(self._on_fill_tick)
+        self._fill_timer.start()
+
         grip = QSizeGrip(self)
         layout.addWidget(grip, alignment=Qt.AlignRight)
 
@@ -1060,6 +1217,9 @@ class OverlayWindow(QWidget):
         action.setDefaultWidget(slider)
         menu.addAction(action)
         menu.addSeparator()
+        a = QAction("Lyrics debug", self)
+        a.triggered.connect(c.show_lyrics_debug)
+        menu.addAction(a)
         a = QAction("Hide overlay", self)
         a.triggered.connect(self.hide)
         menu.addAction(a)
@@ -1093,8 +1253,36 @@ class OverlayWindow(QWidget):
             return ""
         _, word_idx = self.engine.word_index_at(pos)
         self._current_word_idx = word_idx
-        return render_line_html(lyrics.synced_lines[idx], word_idx,
+        return render_line_html(lyrics.synced_lines[idx], word_idx, pos,
+                                offset=self.engine.offset,
                                 sung_color=CRIMSON, unsung_color="#c9d1d9")
+
+    def _on_fill_tick(self):
+        """Mid-word sweep: re-render the current line's word fill from
+        the interpolated position, ~16x/s. Skipped while a line
+        crossfade is in flight (the fader owns the label then) and
+        whenever the HTML hasn't actually changed."""
+        lyrics = self.engine.lyrics
+        if not lyrics or not lyrics.has_synced or not lyrics.has_word_sync:
+            return
+        if self.engine.track.status != "Playing":
+            return
+        if self._current_fader.busy:
+            return
+        idx = self._current_idx
+        if idx < 0:
+            return
+        pos = self.engine.current_position()
+        line_idx, word_idx = self.engine.word_index_at(pos)
+        if line_idx != idx:
+            return
+        if word_idx != self._current_word_idx:
+            self._current_word_idx = word_idx
+        html = render_line_html(lyrics.synced_lines[idx], word_idx, pos,
+                                offset=self.engine.offset,
+                                sung_color=CRIMSON, unsung_color="#c9d1d9")
+        if html != self.current_label.text():
+            self.current_label.setText(html)
 
     def _on_position(self, pos, idx):
         lyrics = self.engine.lyrics
@@ -1113,7 +1301,8 @@ class OverlayWindow(QWidget):
                 self._current_word_idx = word_idx
                 if idx >= 0:
                     self.current_label.setText(
-                        render_line_html(lyrics.synced_lines[idx], word_idx,
+                        render_line_html(lyrics.synced_lines[idx], word_idx, pos,
+                                         offset=self.engine.offset,
                                          sung_color=CRIMSON,
                                          unsung_color="#c9d1d9"))
             return
@@ -1278,6 +1467,11 @@ class AppController:
         act = getattr(self.full, "anim_act", None)
         if act is not None:
             act.setChecked(bool(enabled))
+
+    def show_lyrics_debug(self):
+        """Help > Lyrics debug: raw lyrics file + URL queries/responses."""
+        dlg = LyricsDebugDialog(self.full, self.engine)
+        dlg.exec()
 
     def quit_app(self):
         # Hide everything first, tray icon included: otherwise KDE

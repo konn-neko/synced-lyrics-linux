@@ -38,6 +38,39 @@ _TTML_NS = "http://www.w3.org/ns/ttml"
 _TTML_META_NS = "http://www.w3.org/ns/ttml#metadata"
 
 
+# ------------------------------------------------------------ request log ---
+# Every HTTP request this module makes, with its response, for the
+# Help > Lyrics debug view. Callers that fetch other URLs (album art)
+# log through the same list. Bodies are capped per entry; the log
+# keeps the last 20 requests.
+_REQUEST_LOG: list[dict] = []
+_REQUEST_LOG_MAX = 20
+_REQUEST_LOG_BODY_MAX = 200_000
+
+
+def log_request(url: str, status: str, body: str = "") -> None:
+    """Record one HTTP request + response for the debug view."""
+    if not isinstance(body, str):
+        body = str(body)
+    _REQUEST_LOG.append({
+        "time": time.strftime("%H:%M:%S", time.localtime()),
+        "url": url,
+        "status": status,
+        "body": body[:_REQUEST_LOG_BODY_MAX],
+    })
+    del _REQUEST_LOG[:-_REQUEST_LOG_MAX]
+
+
+def request_log_text() -> str:
+    """The request log as plain text, newest last."""
+    if not _REQUEST_LOG:
+        return "(no HTTP requests yet this run)"
+    blocks = []
+    for e in _REQUEST_LOG:
+        blocks.append(f"[{e['time']}] GET {e['url']}\n-> {e['status']}\n{e['body']}")
+    return "\n\n".join(blocks)
+
+
 def _frac_to_seconds(frac: str | None) -> float:
     """'.x' = tenths, '.xx' = hundredths, '.xxx' = milliseconds."""
     if not frac:
@@ -55,6 +88,10 @@ class LyricWord:
     end: float   # seconds, end of the word
     text: str
     is_background: bool = False
+    # Syllable-level parts (TTML spans inside the word). A word with
+    # no parts is one unit — the fill sweep runs across the whole word.
+    # ELRC words and demo words carry parts=[the word itself].
+    parts: list[LyricWord] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +112,11 @@ class LyricsResult:
     instrumental: bool = False
     source: str = "lrclib"  # lrclib | cache | search | none
     lrclib_id: int | None = None
+    # The raw lyrics file exactly as received (TTML or LRC text), for
+    # the Help > Lyrics debug view. Empty for plain-only results.
+    raw_text: str = ""
+    raw_kind: str = ""  # "ttml" | "lrc" | ""
+    cache_file: str = ""  # cache file this result came from / was saved to
 
     @property
     def has_synced(self) -> bool:
@@ -142,6 +184,11 @@ def _finish_word_ends(lines: list[LyricLine]) -> None:
                 word.end = line.words[j + 1].time
             else:
                 word.end = max(word.time, next_line_time)
+            if not word.parts:
+                # ELRC word: one part — the word itself.
+                word.parts = [LyricWord(time=word.time, end=word.end,
+                                        text=word.text,
+                                        is_background=word.is_background)]
 
 
 def parse_lrc(text: str) -> list[LyricLine]:
@@ -299,12 +346,21 @@ def parse_ttml(text: str) -> list[LyricLine]:
         cur_begin: float | None = None
         cur_end: float | None = None
         cur_bg = False
+        # Syllable parts of the word being built: each timed span is
+        # one part, kept with its own begin/end so the fill sweep can
+        # light a word syllable by syllable instead of all at once.
+        cur_parts: list[LyricWord] = []
         for span in raw_spans:
             if cur_begin is None:
                 cur_begin, cur_end, cur_bg = span["begin"], span["end"], span["is_background"]
             cur_text += span["text"]
             cur_end = span["end"]
             cur_bg = cur_bg or span["is_background"]
+            ptext = span["text"].strip()
+            if ptext:
+                cur_parts.append(LyricWord(time=span["begin"], end=span["end"],
+                                           text=ptext,
+                                           is_background=span["is_background"]))
             # Word boundary: the span text ends in whitespace, or its
             # tail holds whitespace (the space between two words).
             boundary = (span["text"].endswith((" ", "\t", "\n"))
@@ -312,15 +368,20 @@ def parse_ttml(text: str) -> list[LyricLine]:
             if span["tail"].strip():
                 # Punctuation / text outside spans attaches to the word.
                 cur_text += span["tail"].strip()
+                if cur_parts:
+                    cur_parts[-1].text += span["tail"].strip()
             if boundary:
                 words.append(LyricWord(time=cur_begin, end=cur_end or cur_begin,
                                        text=cur_text.strip(),
-                                       is_background=cur_bg))
+                                       is_background=cur_bg,
+                                       parts=cur_parts))
                 cur_text, cur_begin, cur_end, cur_bg = "", None, None, False
+                cur_parts = []
         if cur_text.strip() and cur_begin is not None:
             words.append(LyricWord(time=cur_begin, end=cur_end or cur_begin,
                                    text=cur_text.strip(),
-                                   is_background=cur_bg))
+                                   is_background=cur_bg,
+                                   parts=cur_parts))
         if words:
             line_text = " ".join(w.text for w in words)
             line_time = begin if begin is not None else words[0].time
@@ -372,7 +433,8 @@ def fetch_betterlyrics(
                     return LyricsResult(
                         artist=artist, track=track, album=album,
                         duration=duration, synced_lines=lines,
-                        source="betterlyrics-cache")
+                        source="betterlyrics-cache", raw_text=ttml,
+                        raw_kind="ttml", cache_file=str(p))
         except Exception:
             pass  # corrupt cache: fall through to network
 
@@ -386,12 +448,20 @@ def fetch_betterlyrics(
         url, headers={"User-Agent": CLIENT_HEADER, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10.0) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            log_request(url, f"HTTP {resp.status}", raw)
+            payload = json.loads(raw)
     except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        log_request(url, f"HTTP {e.code}", body)
         # 401 = cache miss without an API key (keys are not being
         # issued); 429 = rate limited. Either way: fall back, don't fail.
         return None
-    except Exception:
+    except Exception as e:
+        log_request(url, "network error", str(e))
         return None
     ttml = payload.get("ttml") if isinstance(payload, dict) else None
     if not ttml:
@@ -401,7 +471,8 @@ def fetch_betterlyrics(
         return None
     result = LyricsResult(
         artist=artist, track=track, album=album, duration=duration,
-        synced_lines=lines, source="betterlyrics")
+        synced_lines=lines, source="betterlyrics", raw_text=ttml,
+        raw_kind="ttml", cache_file=str(_cache_path(cache, key)))
     try:
         cache.mkdir(parents=True, exist_ok=True)
         _cache_path(cache, key).write_text(
@@ -430,8 +501,15 @@ def _get_json(url: str, timeout: float = 10.0) -> dict | list:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            log_request(url, f"HTTP {resp.status}", raw)
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        log_request(url, f"HTTP {e.code}", body)
         if e.code == 429:
             retry = e.headers.get("Retry-After") if e.headers else None
             try:
@@ -454,6 +532,8 @@ def _result_from_record(record: dict, artist: str, track: str, source: str) -> L
         instrumental=bool(record.get("instrumental")),
         source=source,
         lrclib_id=record.get("id"),
+        raw_text=synced_raw,
+        raw_kind="lrc" if synced_raw else "",
     )
 
 
@@ -488,6 +568,7 @@ def fetch_lrclib(
                 rec = data.get("record") or {}
                 result = _result_from_record(rec, artist, track, "cache")
                 result.source = "cache"
+                result.cache_file = str(p)
                 return result
         except Exception:
             pass  # corrupt cache: fall through to network
@@ -533,6 +614,7 @@ def fetch_lrclib(
             return None
         result = _result_from_record(best, artist, track, "search")
 
+    result.cache_file = str(_cache_path(cache, key))
     # Cache the raw record (not the parsed lines) so cache reads re-parse identically.
     try:
         cache.mkdir(parents=True, exist_ok=True)
@@ -597,7 +679,9 @@ def _proportional_words(line: LyricLine, end_time: float) -> list[LyricWord]:
     t = line.time
     for i, part in enumerate(parts):
         dur = span * weights[i] / total_w
-        words.append(LyricWord(time=t, end=t + dur, text=part))
+        w = LyricWord(time=t, end=t + dur, text=part)
+        w.parts = [LyricWord(time=t, end=t + dur, text=part)]
+        words.append(w)
         t += dur
     return words
 
@@ -616,4 +700,6 @@ def demo_result() -> LyricsResult:
         plain_lyrics="",
         instrumental=False,
         source="demo",
+        raw_text=DEMO_LRC,
+        raw_kind="lrc",
     )
