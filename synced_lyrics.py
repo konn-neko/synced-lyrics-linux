@@ -154,8 +154,15 @@ def move_window_to_screen(window: QWidget, app: QApplication, choice) -> object:
 
 
 def build_display_menu(parent, app: QApplication, current_choice, on_pick):
-    """A QMenu listing every display + Primary / Follow mouse."""
-    menu = QMenu("Display", parent)
+    """A QMenu listing every display + Primary / Follow mouse.
+
+    parent must be a QWidget (or None) — QMenu rejects a QApplication
+    as parent, which crashed startup on real desktops where the tray
+    menu is built (headless/offscreen never reached it, because the
+    tray is unavailable there and _build_tray returns early).
+    """
+    menu_parent = parent if isinstance(parent, QWidget) else None
+    menu = QMenu("Display", menu_parent)
     screens = screen_list(app)
     for i, scr in enumerate(screens):
         act = QAction(screen_label(i, scr), menu, checkable=True)
@@ -772,7 +779,7 @@ class AppController:
         menu.addAction(a)
         menu.addSeparator()
         menu.addMenu(build_display_menu(
-            self.app, self.app, self.cfg.get("display", "primary"),
+            menu, self.app, self.cfg.get("display", "primary"),
             self.pick_display))
         self.min_tray_act = QAction("Minimise to tray on close", self.app, checkable=True)
         self.min_tray_act.setChecked(bool(self.cfg.get("minimise_to_tray", True)))

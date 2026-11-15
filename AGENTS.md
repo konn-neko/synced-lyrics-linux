@@ -84,6 +84,12 @@ no login, no API keys.
 - Mode switching: `Ctrl+1` Full App, `Ctrl+2` Overlay; Full App button
   "Pop out overlay"; Overlay double-click / menu / `Ctrl+1` returns.
   `--mode full|overlay` picks the start mode.
+- QMenu's parent must be a QWidget or None — NEVER a QApplication.
+  The tray menu once passed the app as parent to `build_display_menu()`
+  and crashed on real desktops at startup (`TypeError` in `QMenu.__init__`);
+  headless tests missed it because the tray is unavailable offscreen.
+  `build_display_menu()` now guards this, and `test_ui_smoke.py`
+  (run offscreen) covers QApplication / QWidget / None parents.
 - Overlay: frameless, `WindowStaysOnTopHint`, `Qt.Tool` (no taskbar
   entry), translucent dark background, `QSizeGrip`, drag by mouse,
   opacity via `setWindowOpacity`, click-through via
