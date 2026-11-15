@@ -47,6 +47,12 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   continuously instead of stepping letter by letter. Tracks without word timings fall back to
   line-only highlighting, exactly as before. `--demo` shows the
   effect on the sample lyrics.
+- **Choose lyrics** — if several versions of a song exist, `Lyrics >
+  Choose lyrics…` (also in the Overlay menu and the tray menu) lists
+  every LRCLIB match — word-synced first — and the pick applies
+  immediately and sticks for that track. `Lyrics > Re-fetch lyrics
+  (ignore cache)` drops the cached lyrics and pulls fresh, for when
+  the cache has the wrong version.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay
   right-click menu) shows the raw lyrics file exactly as received
   plus every URL query the app made this run with its response, so

@@ -483,6 +483,95 @@ def test_glow_word_label(app):
     print("  glow word label: OK (HTML glow + sweep paint)")
 
 
+def test_choose_lyrics_dialog(app):
+    """Picker: canned LRCLIB search results populate the list; picking
+    one applies it to the engine and caches it under the track."""
+    import mpris  # noqa: F401  (kept for symmetry with the refetch test)
+    import playback
+    from lyrics import LyricsResult
+    from synced_lyrics import ChooseLyricsDialog
+
+    def _candidate(lrclib_id, album, duration, line_text):
+        return LyricsResult(
+            artist="Coldplay", track="Yellow", album=album, duration=duration,
+            synced_lines=[LyricLine(5.0, line_text)], source="search",
+            lrclib_id=lrclib_id,
+            raw_record={"id": lrclib_id, "artistName": "Coldplay",
+                        "trackName": "Yellow", "albumName": album,
+                        "duration": duration,
+                        "syncedLyrics": f"[00:05.00] {line_text}",
+                        "plainLyrics": line_text})
+
+    canned = [_candidate(1, "Parachutes", 269.0, "Look at the stars"),
+              _candidate(2, "Live 2003", 300.0, "Look at the stars (live)")]
+    orig_search = playback.search_lrclib
+    orig_cache = playback.cache_lrclib_record
+    cached = {}
+    playback.search_lrclib = lambda *a, **k: list(canned)
+    playback.cache_lrclib_record = lambda rec, *a, **k: cached.setdefault("path", "/tmp/fake.json")
+    try:
+        engine = playback.PlaybackEngine(demo=True)
+        try:
+            dlg = ChooseLyricsDialog(None, engine)
+            dlg.show()
+            for _ in range(50):  # wait for the worker's search to land
+                _pump(app, 100)
+                if dlg.list_widget.count() > 0:
+                    break
+            assert dlg.list_widget.count() == 2, (
+                f"expected 2 candidates, got {dlg.list_widget.count()}")
+            assert "Parachutes" in dlg.list_widget.item(0).text()
+            dlg.list_widget.setCurrentRow(1)
+            dlg._use_selected()
+            assert engine.lyrics is canned[1], "pick did not apply to the engine"
+            assert cached, "pick was not cached under the track"
+            dlg.close()
+        finally:
+            engine.stop()
+    finally:
+        playback.search_lrclib = orig_search
+        playback.cache_lrclib_record = orig_cache
+    print("  choose lyrics dialog: OK (2 candidates, pick applies + caches)")
+
+
+def test_engine_refetch_ignores_cache(app):
+    """Refetch: force=True clears the cache first and re-pulls fresh."""
+    import mpris
+    import playback
+    from lyrics import LyricsResult
+
+    orig_bl = playback.fetch_betterlyrics
+    orig_lrc = playback.fetch_lrclib
+    orig_clear = playback.clear_track_cache
+    cleared = []
+    playback.clear_track_cache = lambda *a, **k: cleared.append(True) or 1
+    playback.fetch_betterlyrics = lambda *a, **k: None
+    fresh = LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
+                         duration=269.0, synced_lines=[LyricLine(5.0, "Fresh line")],
+                         source="lrclib")
+    playback.fetch_lrclib = lambda *a, **k: fresh
+    try:
+        engine = playback.PlaybackEngine(demo=False)
+        try:
+            engine.track = mpris.TrackInfo(
+                player="test", title="Yellow", artist="Coldplay",
+                album="Parachutes", duration=269.0, status="Playing")
+            engine.refetch_lyrics()
+            for _ in range(50):
+                _pump(app, 100)
+                if engine.lyrics is fresh:
+                    break
+            assert engine.lyrics is fresh, "refetch did not apply the fresh result"
+            assert cleared, "force refetch did not clear the cache first"
+        finally:
+            engine.stop()
+    finally:
+        playback.fetch_betterlyrics = orig_bl
+        playback.fetch_lrclib = orig_lrc
+        playback.clear_track_cache = orig_clear
+    print("  engine refetch: OK (cache cleared, fresh result applied)")
+
+
 def test_lyrics_delegate_and_scroll(app):
     """Regression: word HTML must RENDER, and scrolling must be per-pixel.
 
@@ -609,6 +698,8 @@ def main():
     test_render_line_html_sweep()
     test_delegate_sweep_paint(app)
     test_glow_word_label(app)
+    test_choose_lyrics_dialog(app)
+    test_engine_refetch_ignores_cache(app)
     test_lyrics_debug_text(app)
     test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()

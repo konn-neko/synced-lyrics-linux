@@ -855,6 +855,85 @@ class LyricsDebugDialog(QDialog):
         layout.addLayout(row)
 
 
+def _candidate_label(result) -> str:
+    """One line for a search candidate in the picker list."""
+    flags = ("word-synced" if result.has_word_sync else
+             "synced" if result.has_synced else
+             "plain only" if result.plain_lyrics else
+             "instrumental" if result.instrumental else "no lyrics")
+    dur = fmt_time(result.duration) if result.duration else "??:??"
+    album = f"  •  {result.album}" if result.album else ""
+    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}"
+            + (f"  •  LRCLIB #{result.lrclib_id}" if result.lrclib_id else ""))
+
+
+class ChooseLyricsDialog(QDialog):
+    """Pick which lyrics to use when several match the track.
+
+    Searches LRCLIB for the current track and lists every match
+    (word-synced first). The pick is applied immediately and cached
+    under the current track, so the next lookup loads it directly.
+    """
+
+    def __init__(self, parent, engine):
+        super().__init__(parent)
+        self.engine = engine
+        self.setWindowTitle("Choose lyrics")
+        self.resize(700, 420)
+        layout = QVBoxLayout(self)
+        track = engine.track
+        current = engine.lyrics
+        now = f"{track.display}" if track.display else "(nothing playing)"
+        if current is not None:
+            now += f"   —   now: {current.artist} — {current.track} [{current.source}]"
+        layout.addWidget(QLabel(now))
+        self.status_label = QLabel("Searching LRCLIB …")
+        layout.addWidget(self.status_label)
+        self.list_widget = QListWidget(self)
+        self.list_widget.itemDoubleClicked.connect(lambda _i: self._use_selected())
+        layout.addWidget(self.list_widget, stretch=1)
+        row = QHBoxLayout()
+        self.use_btn = QPushButton("Use selected")
+        self.use_btn.setEnabled(False)
+        self.use_btn.clicked.connect(self._use_selected)
+        row.addWidget(self.use_btn)
+        row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        row.addWidget(cancel_btn)
+        layout.addLayout(row)
+        engine.candidates_ready.connect(self._on_candidates)
+        engine.search_lyrics_candidates()
+
+    def _on_candidates(self, payload):
+        key, results = payload
+        if key != self.engine._search_key:
+            return
+        if isinstance(results, tuple) and results and results[0] == "error":
+            self.status_label.setText(results[1])
+            return
+        if not results:
+            self.status_label.setText("No matches on LRCLIB for this track.")
+            return
+        self.status_label.setText(f"{len(results)} match(es) — pick one:")
+        for result in results:
+            item = QListWidgetItem(_candidate_label(result))
+            item.setData(Qt.UserRole, result)
+            self.list_widget.addItem(item)
+        self.list_widget.setCurrentRow(0)
+        self.use_btn.setEnabled(True)
+
+    def _use_selected(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        result = item.data(Qt.UserRole)
+        if result is None:
+            return
+        self.engine.apply_candidate(result)
+        self.accept()
+
+
 class FullAppWindow(QMainWindow):
     def __init__(self, controller):
         super().__init__()
@@ -1062,6 +1141,16 @@ class FullAppWindow(QMainWindow):
         self.anim_act.triggered.connect(
             lambda checked: c.set_line_animations(checked))
         view_menu.addAction(self.anim_act)
+
+        lyrics_menu = menubar.addMenu("&Lyrics")
+        a = QAction("Choose lyrics…", self)
+        a.setToolTip("Pick from all LRCLIB matches for this track")
+        a.triggered.connect(c.choose_lyrics)
+        lyrics_menu.addAction(a)
+        a = QAction("Re-fetch lyrics (ignore cache)", self)
+        a.setToolTip("Drop the cached lyrics and pull fresh from the network")
+        a.triggered.connect(c.refetch_lyrics)
+        lyrics_menu.addAction(a)
 
         help_menu = menubar.addMenu("&Help")
         a = QAction("Lyrics debug", self)
@@ -1548,6 +1637,13 @@ class OverlayWindow(QWidget):
         a.triggered.connect(self.engine.previous_track)
         menu.addAction(a)
         menu.addSeparator()
+        a = QAction("Choose lyrics…", self)
+        a.triggered.connect(c.choose_lyrics)
+        menu.addAction(a)
+        a = QAction("Re-fetch lyrics (ignore cache)", self)
+        a.triggered.connect(c.refetch_lyrics)
+        menu.addAction(a)
+        menu.addSeparator()
         menu.addMenu(build_display_menu(
             self, QApplication.instance(), self.cfg.get("display", "primary"),
             c.pick_display))
@@ -1761,6 +1857,13 @@ class AppController:
         a.triggered.connect(self.engine.previous_track)
         menu.addAction(a)
         menu.addSeparator()
+        a = QAction("Choose lyrics…", self.app)
+        a.triggered.connect(self.choose_lyrics)
+        menu.addAction(a)
+        a = QAction("Re-fetch lyrics (ignore cache)", self.app)
+        a.triggered.connect(self.refetch_lyrics)
+        menu.addAction(a)
+        menu.addSeparator()
         menu.addMenu(build_display_menu(
             menu, self.app, self.cfg.get("display", "primary"),
             self.pick_display))
@@ -1850,6 +1953,15 @@ class AppController:
         """Help > Lyrics debug: raw lyrics file + URL queries/responses."""
         dlg = LyricsDebugDialog(self.full, self.engine)
         dlg.exec()
+
+    def choose_lyrics(self):
+        """Lyrics > Choose lyrics: pick from all LRCLIB matches."""
+        dlg = ChooseLyricsDialog(self.full, self.engine)
+        dlg.exec()
+
+    def refetch_lyrics(self):
+        """Lyrics > Re-fetch lyrics: re-pull, ignoring the cache."""
+        self.engine.refetch_lyrics()
 
     def quit_app(self):
         # Hide everything first, tray icon included: otherwise KDE

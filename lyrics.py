@@ -117,6 +117,12 @@ class LyricsResult:
     raw_text: str = ""
     raw_kind: str = ""  # "ttml" | "lrc" | ""
     cache_file: str = ""  # cache file this result came from / was saved to
+    # The raw LRCLIB record this result was built from (None for
+    # Better Lyrics / demo). Kept so a picked search candidate can be
+    # cached verbatim under the current track's key — the raw
+    # syncedLyrics keeps its Enhanced-LRC word tags, which a rebuild
+    # from parsed lines would lose.
+    raw_record: dict | None = None
 
     @property
     def has_synced(self) -> bool:
@@ -534,7 +540,109 @@ def _result_from_record(record: dict, artist: str, track: str, source: str) -> L
         lrclib_id=record.get("id"),
         raw_text=synced_raw,
         raw_kind="lrc" if synced_raw else "",
+        raw_record=record,
     )
+
+
+def search_lrclib(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    limit: int = 10,
+) -> list[LyricsResult]:
+    """Search LRCLIB for all matches of a track (the picker list).
+
+    GET /api/search?q=artist track — the records already carry their
+    syncedLyrics, so a picked candidate loads without another fetch.
+    Sorted: word-synced first, then synced, then plain-only, with
+    duration closeness as the tiebreak. Raises LRCLIBRateLimited on
+    429; other HTTP/network errors propagate to the caller.
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return []
+    q = f"{artist} {track}"
+    if album:
+        q += f" {album.strip()}"
+    url = f"{LRCLIB_BASE}/api/search?{urllib.parse.urlencode({'q': q})}"
+    results = _get_json(url)
+    if not isinstance(results, list):
+        return []
+
+    def sort_key(rec: dict):
+        r = _result_from_record(rec, artist, track, "search")
+        rank = 0 if r.has_word_sync else (1 if r.has_synced else 2)
+        dur_diff = 0.0
+        if duration is not None and rec.get("duration"):
+            try:
+                dur_diff = abs(float(rec["duration"]) - float(duration))
+            except (TypeError, ValueError):
+                dur_diff = 0.0
+        return (rank, dur_diff)
+
+    records = [r for r in results if isinstance(r, dict)]
+    records.sort(key=sort_key)
+    return [_result_from_record(r, artist, track, "search")
+            for r in records[:limit]]
+
+
+def clear_track_cache(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+) -> int:
+    """Delete both cache files for a track (Better Lyrics + LRCLIB).
+
+    Used by a forced re-pull: the cached lyrics were wrong, so they
+    must not survive a failed re-fetch either. Returns how many files
+    were removed.
+    """
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    removed = 0
+    for key in (_betterlyrics_cache_key(artist, track, album, duration),
+                _cache_key(artist, track, album, duration)):
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                p.unlink()
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def cache_lrclib_record(
+    record: dict,
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+) -> str | None:
+    """Cache a raw LRCLIB record under the given track's key.
+
+    The raw record is stored verbatim (not rebuilt from parsed lines)
+    so Enhanced-LRC word tags survive the round-trip. Returns the
+    cache file path, or None if the write failed.
+    """
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _cache_key(artist, track, album, duration)
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        p = _cache_path(cache, key)
+        p.write_text(
+            json.dumps({"record": record, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+        return str(p)
+    except Exception:
+        return None
 
 
 def fetch_lrclib(
@@ -591,6 +699,7 @@ def fetch_lrclib(
 
     if isinstance(record, dict) and record.get("id"):
         result = _result_from_record(record, artist, track, "lrclib")
+        raw_record = record
     else:
         # Fallback: /api/search, pick closest duration match with synced lyrics.
         q = f"{artist} {track}"
@@ -613,30 +722,12 @@ def fetch_lrclib(
         if best is None:
             return None
         result = _result_from_record(best, artist, track, "search")
+        raw_record = best
 
     result.cache_file = str(_cache_path(cache, key))
-    # Cache the raw record (not the parsed lines) so cache reads re-parse identically.
-    try:
-        cache.mkdir(parents=True, exist_ok=True)
-        raw = {
-            "artistName": result.artist,
-            "trackName": result.track,
-            "albumName": result.album,
-            "duration": result.duration,
-            "syncedLyrics": "\n".join(
-                f"[{int(l.time // 60):02d}:{l.time % 60:05.2f}] {l.text}"
-                for l in result.synced_lines
-            ) if result.synced_lines else None,
-            "plainLyrics": result.plain_lyrics or None,
-            "instrumental": result.instrumental,
-            "id": result.lrclib_id,
-        }
-        _cache_path(cache, key).write_text(
-            json.dumps({"record": raw, "fetched_at": time.time()}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+    # Cache the raw record verbatim (not rebuilt from parsed lines)
+    # so Enhanced-LRC word tags survive the round-trip.
+    cache_lrclib_record(raw_record, artist, track, album, duration, cache)
     return result
 
 

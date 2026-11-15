@@ -20,12 +20,15 @@ from lyrics import (  # noqa: E402
     LyricLine,
     LyricWord,
     _REQUEST_LOG,
+    cache_lrclib_record,
+    clear_track_cache,
     fetch_betterlyrics,
     fetch_lrclib,
     log_request,
     parse_lrc,
     parse_ttml,
     request_log_text,
+    search_lrclib,
 )
 
 
@@ -219,6 +222,66 @@ def test_line_at_with_offset():
     assert LyricsResult(artist="A", track="T").line_at(5.0) == -1
 
 
+def test_cache_roundtrip_keeps_word_tags():
+    """A cached ELRC record must reload with its word timings intact.
+
+    (Regression: the old cache write rebuilt syncedLyrics from parsed
+    lines, which dropped the <mm:ss.xx> word tags — a cached track
+    lost word sync on reload.)
+    """
+    record = {
+        "id": 123, "artistName": "Jamiroquai", "trackName": "Virtual Insanity",
+        "albumName": "", "duration": 340.0, "instrumental": False,
+        "syncedLyrics": "[00:01.050]<00:01.050>Virtual <00:01.390>Insanity <00:01.710>- <00:02.140>Jamiroquai",
+        "plainLyrics": "Virtual Insanity - Jamiroquai",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        path = cache_lrclib_record(record, "Jamiroquai", "Virtual Insanity",
+                                   "", 340.0, cache_dir=cache)
+        assert path is not None and Path(path).exists()
+        result = fetch_lrclib("Jamiroquai", "Virtual Insanity", "", 340.0,
+                              cache_dir=cache)
+        assert result is not None and result.source == "cache"
+        assert result.has_word_sync, "word timings lost in the cache round-trip"
+        assert result.synced_lines[0].words[0].text == "Virtual"
+        assert result.raw_record is not None and result.raw_record["id"] == 123
+    print("  cache round-trip: OK (ELRC word tags survive)")
+
+
+def test_clear_track_cache():
+    """clear_track_cache removes both providers' files for a track."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        cache_lrclib_record({"id": 1, "artistName": "A", "trackName": "T",
+                             "syncedLyrics": "", "plainLyrics": ""},
+                            "A", "T", "", None, cache_dir=cache)
+        # Fake a Better Lyrics cache file for the same track.
+        from lyrics import _betterlyrics_cache_key, _cache_path
+        bl = _cache_path(cache, _betterlyrics_cache_key("A", "T", "", None))
+        bl.write_text('{"ttml": "<tt></tt>"}', encoding="utf-8")
+        assert clear_track_cache("A", "T", "", None, cache_dir=cache) == 2
+        assert not bl.exists()
+        assert clear_track_cache("A", "T", "", None, cache_dir=cache) == 0
+    print("  clear_track_cache: OK (2 files, then 0)")
+
+
+def test_live_lrclib_search():
+    """Live check: searching Coldplay — Yellow returns several matches,
+    word-synced ones first. Skipped when offline."""
+    try:
+        results = search_lrclib("Coldplay", "Yellow", "Parachutes", 269.0)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live LRCLIB search test (offline: {e})")
+        return "skip"
+    assert results, "LRCLIB search returned no matches for Coldplay — Yellow"
+    assert any(r.has_synced for r in results), "no synced match in search results"
+    print(f"  live search: {len(results)} match(es), first = "
+          f"{results[0].artist} — {results[0].track} "
+          f"(word sync: {results[0].has_word_sync})")
+    return "pass"
+
+
 def test_live_betterlyrics_fetch():
     """Live check: Coldplay — Yellow via the Better Lyrics API should
     come back as TTML with word timings. A None result (401: song not
@@ -274,6 +337,9 @@ TESTS = [
     test_parse_ttml_syllable_parts,
     test_elrc_word_parts,
     test_request_log,
+    test_cache_roundtrip_keeps_word_tags,
+    test_clear_track_cache,
+    test_live_lrclib_search,
     test_out_of_order_lines_sorted,
     test_line_at_with_offset,
     test_live_betterlyrics_fetch,

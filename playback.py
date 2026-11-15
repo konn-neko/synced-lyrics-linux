@@ -20,9 +20,12 @@ import mpris
 from lyrics import (
     LRCLIBRateLimited,
     LyricsResult,
+    cache_lrclib_record,
+    clear_track_cache,
     demo_result,
     fetch_betterlyrics,
     fetch_lrclib,
+    search_lrclib,
 )
 
 
@@ -71,32 +74,52 @@ class MonotonicPosition:
 
 
 class _LyricsWorker(QObject):
-    result_ready = Signal(object)  # LyricsResult | None, or ("error", str)
-    fetch_requested = Signal(str, str, str, float, object)
+    result_ready = Signal(object)  # (key, LyricsResult | None | ("error", str))
+    search_ready = Signal(object)  # (key, [LyricsResult] | ("error", str))
+    fetch_requested = Signal(str, str, str, float, object, bool)
+    search_requested = Signal(str, str, str, float, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.fetch_requested.connect(self.fetch)
+        self.search_requested.connect(self.search)
 
-    def fetch(self, artist, track, album, duration, key):
+    def fetch(self, artist, track, album, duration, key, force=False):
         try:
+            if force:
+                # The cached lyrics were wrong: drop them first so a
+                # failed re-pull can't leave the wrong ones in place.
+                clear_track_cache(artist, track, album, duration)
             # Provider order: Better Lyrics TTML (word sync) first,
             # LRCLIB line sync as fallback. fetch_betterlyrics returns
             # None on 401 (uncached, no key) / 429 / network error —
             # the track never fails for it, it just falls back.
-            result = fetch_betterlyrics(artist, track, album, duration)
+            result = fetch_betterlyrics(artist, track, album, duration,
+                                        use_cache=not force)
             if result is None:
-                result = fetch_lrclib(artist, track, album, duration)
+                result = fetch_lrclib(artist, track, album, duration,
+                                      use_cache=not force)
             self.result_ready.emit((key, result))
         except LRCLIBRateLimited as e:
             self.result_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
         except Exception as e:  # network etc: surface, don't crash the poller
             self.result_ready.emit((key, ("error", str(e))))
 
+    def search(self, artist, track, album, duration, key):
+        """LRCLIB search for the Choose-lyrics picker (all matches)."""
+        try:
+            results = search_lrclib(artist, track, album, duration)
+            self.search_ready.emit((key, results))
+        except LRCLIBRateLimited as e:
+            self.search_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
+        except Exception as e:
+            self.search_ready.emit((key, ("error", str(e))))
+
 
 class PlaybackEngine(QObject):
     track_changed = Signal(object)      # mpris.TrackInfo
     lyrics_changed = Signal(object)     # LyricsResult | None
+    candidates_ready = Signal(object)   # (key, [LyricsResult] | ("error", str))
     status_changed = Signal(str)        # human-readable status line
     position_changed = Signal(float, int)  # position seconds, current line index
     players_changed = Signal(list)      # list[str]
@@ -117,6 +140,7 @@ class PlaybackEngine(QObject):
         self._demo_pos = 0.0
         self._demo_playing = True
         self._fetch_key: tuple | None = None
+        self._search_key: tuple | None = None
         self._players: list[str] = []
 
         self._worker_thread = QThread(self)
@@ -125,6 +149,7 @@ class PlaybackEngine(QObject):
         # fetch_requested is emitted from the GUI thread and queued to the worker
         self._fetch_requested = self._worker.fetch_requested
         self._worker.result_ready.connect(self._on_lyrics_result)
+        self._worker.search_ready.connect(self._on_search_result)
         self._worker_thread.start()
 
         self._timer = QTimer(self)
@@ -251,7 +276,7 @@ class PlaybackEngine(QObject):
         self._fetch_key = track.key
         self.status_changed.emit(f"Looking up lyrics for {track.display} …")
         # Run the network fetch on the worker thread (queued signal).
-        self._worker.fetch_requested.emit(track.artist, track.title, track.album, track.duration or 0.0, track.key)
+        self._worker.fetch_requested.emit(track.artist, track.title, track.album, track.duration or 0.0, track.key, False)
 
     def _on_lyrics_result(self, payload):
         key, result = payload
@@ -320,7 +345,71 @@ class PlaybackEngine(QObject):
         key = (artist.lower().strip(), track.lower().strip(), "", 0)
         self._fetch_key = key
         self.status_changed.emit(f"Looking up lyrics for {artist} — {track} …")
-        self._worker.fetch_requested.emit(artist, track, "", 0.0, key)
+        self._worker.fetch_requested.emit(artist, track, "", 0.0, key, False)
+
+    def search_lyrics_candidates(self):
+        """Start an LRCLIB search for the current track (picker list)."""
+        track = self.track
+        if not track.title or not track.artist:
+            self.status_changed.emit("No track metadata — cannot search for lyrics")
+            return
+        self._search_key = track.key
+        self._worker.search_requested.emit(
+            track.artist, track.title, track.album, track.duration or 0.0,
+            track.key)
+
+    def _on_search_result(self, payload):
+        key, _results = payload
+        if key != self._search_key:
+            return  # stale search for a track we already left
+        self.candidates_ready.emit(payload)
+
+    def refetch_lyrics(self):
+        """Re-pull lyrics for the current track, ignoring the cache.
+
+        Drops both cache files first, then fetches fresh (Better
+        Lyrics, then LRCLIB). Demo mode has no network to re-pull from.
+        """
+        if self.demo:
+            self.status_changed.emit("Demo mode — nothing to re-fetch")
+            return
+        track = self.track
+        if not track.title or not track.artist:
+            self.status_changed.emit("No track metadata — nothing to re-fetch")
+            return
+        self._fetch_key = track.key
+        self.status_changed.emit(
+            f"Re-fetching lyrics for {track.display} (ignoring cache) …")
+        self._worker.fetch_requested.emit(
+            track.artist, track.title, track.album, track.duration or 0.0,
+            track.key, True)
+
+    def apply_candidate(self, result):
+        """Use a lyrics result picked from the search list.
+
+        The pick is cached verbatim under the current track's key, so
+        the next lookup for this track loads it directly instead of
+        re-picking the wrong match.
+        """
+        if result is None:
+            return
+        track = self.track
+        if result.raw_record is not None and track.title and track.artist:
+            path = cache_lrclib_record(
+                result.raw_record, track.artist, track.title,
+                track.album, track.duration or 0.0)
+            if path:
+                result.cache_file = path
+        self.lyrics = result
+        self.lyrics_changed.emit(result)
+        flags = ("word-synced" if result.has_word_sync else
+                 "synced" if result.has_synced else
+                 "plain" if result.plain_lyrics else "no lyrics")
+        self.status_changed.emit(
+            f"Using lyrics: {result.artist} — {result.track}"
+            + (f" ({result.album})" if result.album else "")
+            + f" — LRCLIB search, {flags}")
+        self._emit_position()
 
     # ------------------------------------------------------------- controls
     def play_pause(self):

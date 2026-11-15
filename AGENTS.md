@@ -230,6 +230,21 @@ no login, no API keys.
   QTextCursor char formats instead. The HTML path is still the
   fallback for every other row, and the item text is still set to
   the word HTML (tests + fallback).
+- Lyrics picker + re-pull: when several versions match a track, **Lyrics
+  > Choose lyrics…** (also in the overlay right-click menu and the tray
+  menu) searches LRCLIB and lists every match — word-synced first, each
+  with artist, album, duration and sync flags — and the pick applies
+  immediately. The pick is cached verbatim under the current track's
+  key (`cache_lrclib_record`), so the next lookup loads it directly.
+  **Lyrics > Re-fetch lyrics (ignore cache)** drops both cache files
+  for the track (`clear_track_cache`) and pulls fresh (Better Lyrics,
+  then LRCLIB) — for when the cached lyrics are wrong. Worker side:
+  `_LyricsWorker.search` + `PlaybackEngine.search_lyrics_candidates` /
+  `apply_candidate` / `refetch_lyrics` (fetch takes `force`, which
+  passes `use_cache=False`). Side fix in the same round: the LRCLIB
+  cache write used to rebuild syncedLyrics from parsed lines, which
+  dropped Enhanced-LRC word tags — a cached track lost word sync on
+  reload. It now caches the raw record verbatim.
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
   + LRCLIB, via `log_request(url, status, body)` in `_get_json` and
   `fetch_betterlyrics`; album-art fetches in `synced_lyrics.py`
