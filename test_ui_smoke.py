@@ -37,11 +37,13 @@ from lyrics import LyricLine, LyricWord, LyricsResult  # noqa: E402
 from playback import MonotonicPosition, PlaybackEngine  # noqa: E402
 from synced_lyrics import (  # noqa: E402
     DEFAULT_CONFIG,
+    GlowWordLabel,
     LabelFader,
     LyricsItemDelegate,
     SmoothScroller,
     _lerp_color,
     _lerp_hex,
+    _sweep_front,
     build_display_menu,
     build_lyrics_debug_text,
     render_line_html,
@@ -384,6 +386,103 @@ def test_lyrics_debug_text(app):
     print("  lyrics debug text: OK (track, source, raw file, request log, dialog builds)")
 
 
+def test_sweep_front():
+    """Float character position of the sweep front in the line text."""
+    line = LyricLine(1.05, "Vir-tual Insanity", [
+        LyricWord(1.05, 1.71, "Vir-tual", parts=[
+            LyricWord(1.05, 1.39, "Vir-"), LyricWord(1.39, 1.71, "tual")]),
+        LyricWord(1.71, 2.14, "Insanity", parts=[
+            LyricWord(1.71, 2.14, "Insanity")])])
+    assert _sweep_front(line, -1, 1.5) is None
+    assert _sweep_front(line, 0, 0.5) == 0.0  # before the word starts
+    # Mid first syllable: (1.20-1.05)/(1.39-1.05) * 4 chars = 1.7647.
+    assert abs(_sweep_front(line, 0, 1.20) - 1.7647) < 0.01
+    # Past the first word: front at its end (8 chars).
+    assert _sweep_front(line, 0, 1.80) == 8.0
+    # Mid second word: offset 9 + (1.80-1.71)/(2.14-1.71) * 8 = 10.674.
+    assert abs(_sweep_front(line, 1, 1.80) - 10.674) < 0.01
+    # pos=None: whole active word sung.
+    assert _sweep_front(line, 0, None) == 8.0
+    # No word timings: None.
+    assert _sweep_front(LyricLine(0.0, "plain"), 0, 1.0) is None
+    print("  _sweep_front: OK (before / mid-syllable / past word / None)")
+
+
+def _count_pixels(img, pred):
+    n = 0
+    for y in range(0, img.height(), 2):
+        for x in range(0, img.width(), 2):
+            if pred(img.pixelColor(x, y)):
+                n += 1
+    return n
+
+
+def _demo_line():
+    return LyricLine(5.0, "Look at the stars", [
+        LyricWord(5.0, 6.25, "Look", parts=[LyricWord(5.0, 6.25, "Look")]),
+        LyricWord(6.25, 7.0, "at", parts=[LyricWord(6.25, 7.0, "at")]),
+        LyricWord(7.0, 8.0, "the", parts=[LyricWord(7.0, 8.0, "the")]),
+        LyricWord(8.0, 9.5, "stars", parts=[LyricWord(8.0, 9.5, "stars")])])
+
+
+def _is_crimson(c):
+    return c.red() > 200 and c.green() < 110 and c.blue() < 140
+
+
+def _is_dim(c):
+    return 100 < c.red() < 180 and 120 < c.green() < 180 and 130 < c.blue() < 190
+
+
+def test_delegate_sweep_paint(app):
+    """The delegate's smooth sweep paint: sung text crimson with a
+    soft front, unsung text dim — no crash, both colours visible."""
+    line = _demo_line()
+    lst = QListWidget()
+    lst.resize(500, 200)
+    delegate = LyricsItemDelegate(lst)
+    lst.setItemDelegate(delegate)
+    lst.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+    lst.setWordWrap(True)
+    item = QListWidgetItem("Look at the stars")
+    item.setForeground(QColor("#FF1A47"))
+    lst.addItem(item)
+    # Row 0 is current, front mid-word "the" (7.5 s).
+    delegate.sweep_provider = lambda row: (
+        {"line": line, "word_idx": 2, "pos": 7.5} if row == 0 else None)
+    lst.show()
+    _pump(app, 150)
+    img = lst.viewport().grab().toImage()
+    assert _count_pixels(img, _is_crimson) > 0, "no crimson (sung) pixels painted"
+    assert _count_pixels(img, _is_dim) > 0, "no dim (unsung) pixels painted"
+    print("  delegate sweep paint: OK (crimson + dim visible, soft front)")
+
+
+def test_glow_word_label(app):
+    """GlowWordLabel paints its word HTML with a crimson glow, and
+    the smooth sweep path when a provider is set."""
+    line = _demo_line()
+    label = GlowWordLabel()
+    label.resize(500, 80)
+    label.setStyleSheet("color:#FF1A47; font-size:30px; font-weight:bold;")
+    label.setAlignment(Qt.AlignCenter)
+    label.setText(render_line_html(line, 2, 7.5,
+                                   sung_color="#FF1A47", unsung_color="#c9d1d9"))
+    label.show()
+    _pump(app, 150)
+    img = label.grab().toImage()
+    assert _count_pixels(img, _is_crimson) > 0, "no crimson pixels (HTML path)"
+    # Smooth sweep path via provider. Unsung here is the overlay's
+    # light grey #c9d1d9, not the Full App dim.
+    label.sweep_provider = lambda: {"line": line, "word_idx": 2, "pos": 7.5}
+    label.update()
+    _pump(app, 150)
+    img2 = label.grab().toImage()
+    assert _count_pixels(img2, _is_crimson) > 0, "no crimson pixels (sweep path)"
+    assert _count_pixels(img2, lambda c: c.red() > 180 and c.green() > 190
+                         and c.blue() > 200) > 0, "no light-grey pixels (sweep path)"
+    print("  glow word label: OK (HTML glow + sweep paint)")
+
+
 def test_lyrics_delegate_and_scroll(app):
     """Regression: word HTML must RENDER, and scrolling must be per-pixel.
 
@@ -506,7 +605,10 @@ def main():
     test_local_server_raise(app)
     test_render_line_html()
     test_lerp_hex()
+    test_sweep_front()
     test_render_line_html_sweep()
+    test_delegate_sweep_paint(app)
+    test_glow_word_label(app)
     test_lyrics_debug_text(app)
     test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()

@@ -26,12 +26,14 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve, QLockFile, QPropertyAnimation, QSize, Qt, QTimer, QUrl,
+    QEasingCurve, QLockFile, QPropertyAnimation, QRectF, QSize, Qt, QTimer,
+    QUrl,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap,
-    QTextDocument,
+    QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QImage,
+    QLinearGradient, QPainter, QPixmap, QTextCharFormat, QTextCursor,
+    QTextDocument, QTextOption,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
@@ -319,6 +321,140 @@ def render_line_html(line, word_idx: int, pos: float | None = None,
     return " ".join(parts)
 
 
+def _sweep_front(line, word_idx: int, pos: float | None):
+    """Float character position of the sweep front in line.text.
+
+    Pure helper (no Qt) so tests can cover it. Words before word_idx
+    are fully sung; inside the active word the front moves through
+    its syllable parts at `pos` (the caller applies the sync offset
+    first). Returns None when nothing is sung yet, or the line has
+    no word timings.
+    """
+    if word_idx < 0 or not line.words:
+        return None
+    if word_idx >= len(line.words):
+        return None
+    offsets = []
+    o = 0
+    for w in line.words:
+        offsets.append(o)
+        o += len(w.text) + 1
+    word = line.words[word_idx]
+    start = offsets[word_idx]
+    if pos is None:
+        return float(start + len(word.text))
+    parts = word.parts or [word]
+    sung = 0
+    for part in parts:
+        if pos >= part.end:
+            sung += len(part.text)
+        elif pos <= part.time:
+            break
+        else:
+            dur = max(0.001, part.end - part.time)
+            return start + sung + (pos - part.time) / dur * len(part.text)
+    return float(start + sung)
+
+
+def _paint_sweep_text(painter, rect, font, text, front, sung_color,
+                      unsung_color, alignment=Qt.AlignLeft):
+    """Paint text with a pixel-smooth sweep front + glow.
+
+    `front` is the float character position in `text` (_sweep_front).
+    Text behind the front is `sung_color` through a soft-edged alpha
+    mask with a low-opacity offset glow underneath; text ahead of the
+    front is `unsung_color`. HTML alone can only flip whole
+    characters, so on a long held syllable the front would visibly
+    step — here it is a continuous pixel position, re-painted ~16x/s
+    from the interpolated playback position. Shared by the Full App
+    delegate (current row) and the overlay label.
+    """
+    width = max(1, int(rect.width()))
+
+    def make_doc(color):
+        doc = QTextDocument()
+        doc.setDocumentMargin(2)
+        doc.setDefaultFont(font)
+        text_option = QTextOption()
+        text_option.setAlignment(alignment)
+        doc.setDefaultTextOption(text_option)
+        doc.setPlainText(text)
+        doc.setTextWidth(width)
+        # NOTE: a `body { color: ... }` default stylesheet does NOT
+        # colour the text in Qt (it renders black) — set the colour
+        # via a char format on the whole document instead.
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.Document)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.mergeCharFormat(fmt)
+        return doc
+
+    dim_doc = make_doc(unsung_color)
+    doc_h = dim_doc.size().height()
+    yoff = max(0.0, (rect.height() - doc_h) / 2)
+    painter.save()
+    painter.translate(rect.topLeft())
+    painter.translate(0, yoff)
+    dim_doc.drawContents(painter)
+    painter.restore()
+    if front is None or front <= 0:
+        return
+    crimson_doc = make_doc(sung_color)
+    img_h = max(1, int(crimson_doc.size().height()) + 4)
+    img = QImage(width, img_h, QImage.Format_ARGB32_Premultiplied)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    crimson_doc.drawContents(p)
+    p.end()
+
+    # Alpha mask: opaque where the text is fully sung, a soft
+    # gradient across the front, transparent past it.
+    mask = QImage(width, img_h, QImage.Format_ARGB32_Premultiplied)
+    mask.fill(QColor(0, 0, 0, 0))
+    mp = QPainter(mask)
+    margin = crimson_doc.documentMargin()
+    fm = QFontMetrics(font)
+    front_ci = min(len(text), int(front))
+    front_frac = front - front_ci
+    layout = crimson_doc.firstBlock().layout()
+    soft = 8
+    for i in range(layout.lineCount()):
+        ln = layout.lineAt(i)
+        r = QRectF(margin + ln.x(), margin + ln.y(), ln.width(), ln.height())
+        line_end = ln.textStart() + ln.textLength()
+        if front_ci >= line_end and i < layout.lineCount() - 1:
+            # Whole visual line is sung (front is past its end).
+            mp.fillRect(r, QColor(255, 255, 255, 255))
+        elif ln.textStart() <= front_ci:
+            # The front is on (or past the end of) this line.
+            x_in = fm.horizontalAdvance(text[ln.textStart():front_ci])
+            if front_ci < len(text):
+                x_in += front_frac * fm.horizontalAdvance(text[front_ci])
+            front_x = margin + ln.x() + x_in
+            grad = QLinearGradient(front_x - soft, 0, front_x + soft, 0)
+            grad.setColorAt(0.0, QColor(255, 255, 255, 255))
+            grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+            mp.fillRect(r, grad)
+        # Lines after the front stay transparent.
+    mp.end()
+    mp = QPainter(img)
+    mp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+    mp.drawImage(0, 0, mask)
+    mp.end()
+
+    # Glow: low-opacity offset copies, then the sharp pass.
+    painter.save()
+    painter.translate(rect.topLeft())
+    painter.translate(0, yoff)
+    painter.setOpacity(0.30)
+    for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
+        painter.drawImage(dx, dy, img)
+    painter.setOpacity(1.0)
+    painter.drawImage(0, 0, img)
+    painter.restore()
+
+
 class LyricsItemDelegate(QStyledItemDelegate):
     """Paint list items as rich text with a QTextDocument.
 
@@ -333,18 +469,70 @@ class LyricsItemDelegate(QStyledItemDelegate):
     works. Row heights are re-queried whenever an item's text changes
     (every word tick / line change), so resizing the window reflows
     rows as lyrics update.
+
+    The current line is painted differently: HTML can only flip
+    whole characters, so on a long held syllable the front visibly
+    steps. When `sweep_provider` returns data for a row (set by
+    FullAppWindow), that row is painted pixel-smooth instead — the
+    sung text in crimson through a soft-edged alpha mask with a glow
+    underneath (see _paint_sweep).
     """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Optional provider: fn(row) -> {"line", "word_idx", "pos"}
+        # for the current row, or None. When it returns data, that
+        # row gets the smooth sweep paint instead of the HTML paint.
+        self.sweep_provider = None
 
     def _document(self, option, index):
         doc = QTextDocument()
         doc.setDocumentMargin(2)
         doc.setDefaultFont(option.font)
         fg = option.palette.text().color()
-        doc.setDefaultStyleSheet(f"body {{ color: {fg.name()}; }}")
-        doc.setHtml(index.data(Qt.DisplayRole) or "")
+        text = index.data(Qt.DisplayRole) or ""
+        doc.setHtml(text)
+        if "<" not in text:
+            # Plain line (no spans carry a colour): a `body` colour
+            # stylesheet does NOT apply in Qt — the line would render
+            # black on the dark background. Set it via char format.
+            cursor = QTextCursor(doc)
+            cursor.select(QTextCursor.Document)
+            fmt = QTextCharFormat()
+            fmt.setForeground(fg)
+            cursor.mergeCharFormat(fmt)
         return doc
 
+    def _plain_document(self, option, text, color):
+        """Plain-text document in the item's font, one colour.
+
+        (Layout only — sizeHint. The colour is set via char format:
+        a `body` stylesheet colour does not apply in Qt.)
+        """
+        doc = QTextDocument()
+        doc.setDocumentMargin(2)
+        doc.setDefaultFont(option.font)
+        doc.setPlainText(text)
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.Document)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.mergeCharFormat(fmt)
+        return doc
+
+    def _sweep_for(self, index):
+        if self.sweep_provider is None:
+            return None
+        try:
+            return self.sweep_provider(index.row())
+        except Exception:
+            return None
+
     def paint(self, painter, option, index):
+        sweep = self._sweep_for(index)
+        if sweep is not None:
+            self._paint_sweep(painter, option, index, sweep)
+            return
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         opt.text = ""  # background only here; the document draws the text
@@ -359,6 +547,22 @@ class LyricsItemDelegate(QStyledItemDelegate):
         doc.drawContents(painter)
         painter.restore()
 
+    def _paint_sweep(self, painter, option, index, sweep):
+        """Pixel-smooth sweep with glow for the current line.
+
+        The sung colour is the item's foreground, so the line-change
+        colour crossfade still works.
+        """
+        line = sweep["line"]
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""  # background only here; the sweep paint draws text
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
+        front = _sweep_front(line, sweep["word_idx"], sweep["pos"])
+        _paint_sweep_text(painter, opt.rect, opt.font, line.text, front,
+                          opt.palette.text().color().name(), DIM)
+
     def sizeHint(self, option, index):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
@@ -368,9 +572,97 @@ class LyricsItemDelegate(QStyledItemDelegate):
             width = widget.viewport().width()
         if not width:
             width = opt.rect.width() or 400
+        sweep = self._sweep_for(index)
+        if sweep is not None:
+            # Same plain-text document the sweep paint uses, so the
+            # row height matches the painted text exactly.
+            doc = self._plain_document(
+                opt, sweep["line"].text, opt.palette.text().color().name())
+            doc.setTextWidth(width)
+            return QSize(int(doc.idealWidth()), int(doc.size().height()) + 6)
         doc = self._document(opt, index)
         doc.setTextWidth(width)
         return QSize(int(doc.idealWidth()), int(doc.size().height()) + 6)
+
+
+class GlowWordLabel(QLabel):
+    """QLabel that paints its rich text with a crimson glow behind
+    the sung spans.
+
+    QLabel has no text-shadow, and a QGraphicsDropShadowEffect can't
+    coexist with the LabelFader's opacity effect on the same label —
+    so this paints the glow itself. The label text is rendered a
+    second time with every non-crimson colour replaced by the
+    background colour (so only the sung spans show), drawn at low
+    opacity with small offsets, then the normal text is drawn on top.
+    """
+
+    # Colours that mean "not sung" in the overlay's word HTML.
+    UNSUNG_COLORS = ("#c9d1d9", "#8b949e")
+    GLOW_BG = "#0d1117"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Optional provider: fn() -> {"line", "word_idx", "pos"} for
+        # the current line, or None. Set by OverlayWindow; when it
+        # returns data the label paints the smooth sweep (same as the
+        # Full App delegate) instead of its HTML text.
+        self.sweep_provider = None
+
+    def paintEvent(self, event):
+        sweep = None
+        if self.sweep_provider is not None:
+            try:
+                sweep = self.sweep_provider()
+            except Exception:
+                sweep = None
+        if sweep is not None:
+            front = _sweep_front(sweep["line"], sweep["word_idx"], sweep["pos"])
+            p = QPainter(self)
+            _paint_sweep_text(p, self.rect(), self.font(),
+                              sweep["line"].text, front, CRIMSON, "#c9d1d9",
+                              alignment=self.alignment())
+            p.end()
+            return
+        text = self.text()
+        if not text:
+            return
+        width = max(1, self.width())
+        text_option = QTextOption()
+        text_option.setAlignment(self.alignment())
+
+        def make_doc(html_text):
+            doc = QTextDocument()
+            doc.setDocumentMargin(0)
+            doc.setDefaultFont(self.font())
+            doc.setDefaultTextOption(text_option)
+            doc.setHtml(html_text)
+            doc.setTextWidth(width)
+            return doc
+
+        doc = make_doc(text)
+        yoff = max(0.0, (self.height() - doc.size().height()) / 2)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # Glow pass: only the sung (crimson) spans, offset + faint.
+        glow_html = text
+        for c in self.UNSUNG_COLORS:
+            glow_html = glow_html.replace(c, self.GLOW_BG)
+        if glow_html != text:
+            gdoc = make_doc(glow_html)
+            p.save()
+            p.translate(0, yoff)
+            p.setOpacity(0.35)
+            for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
+                p.save()
+                p.translate(dx, dy)
+                gdoc.drawContents(p)
+                p.restore()
+            p.restore()
+        p.save()
+        p.translate(0, yoff)
+        doc.drawContents(p)
+        p.restore()
 
 
 class SmoothScroller:
@@ -673,6 +965,9 @@ class FullAppWindow(QMainWindow):
         # Rich-text rows: the default delegate shows render_line_html()
         # tags literally; LyricsItemDelegate paints the HTML instead.
         self.lyrics_list.setItemDelegate(LyricsItemDelegate(self.lyrics_list))
+        # The delegate paints the current line pixel-smooth (soft edge
+        # + glow) from this provider instead of the per-character HTML.
+        self.lyrics_list.itemDelegate().sweep_provider = self._sweep_for_row
         # ScrollPerPixel is REQUIRED for the smooth scroll: the default
         # ScrollPerItem measures the scrollbar in whole items, so the
         # pixel target SmoothScroller computes was clamped to the item
@@ -949,6 +1244,26 @@ class FullAppWindow(QMainWindow):
                   - self.lyrics_list.viewport().height() // 2)
         self._scroller.scroll_to(target, enabled=animated)
 
+    def _sweep_for_row(self, row):
+        """Smooth-glow paint data for the current lyrics row, or None.
+
+        The delegate paints the current line pixel-smooth (soft edge
+        + glow) from this instead of the per-character HTML: the HTML
+        can only flip whole characters, so on a long held syllable
+        the front visibly steps. The provider reads the live
+        interpolated position, so the front moves continuously.
+        """
+        lyrics = self.engine.lyrics
+        if not lyrics or not lyrics.has_word_sync:
+            return None
+        if row != self._current_idx:
+            return None
+        if not (0 <= row < len(lyrics.synced_lines)):
+            return None
+        return {"line": lyrics.synced_lines[row],
+                "word_idx": self._current_word_idx,
+                "pos": self.engine.current_position() + self.engine.offset}
+
     def _render_current_words(self):
         """Apply word-by-word HTML to the current line's list item.
 
@@ -992,6 +1307,10 @@ class FullAppWindow(QMainWindow):
                                 offset=self.engine.offset)
         if html != item.text():
             item.setText(html)
+        # The smooth sweep paint reads the live position, not the item
+        # text — repaint every tick so the front moves continuously
+        # even while the HTML is unchanged (long held syllable).
+        self.lyrics_list.viewport().update()
 
     def _on_fade_tick(self):
         self._fade_step += 1
@@ -1130,10 +1449,13 @@ class OverlayWindow(QWidget):
         top.addWidget(self.close_btn)
         layout.addLayout(top)
 
-        self.current_label = QLabel("♪")
+        self.current_label = GlowWordLabel("♪")
         self.current_label.setWordWrap(True)
         self.current_label.setAlignment(Qt.AlignCenter)
         self.current_label.setStyleSheet(f"color:{CRIMSON}; font-size:30px; font-weight:bold;")
+        # The label paints the current line pixel-smooth (soft edge +
+        # glow) from this provider instead of the per-character HTML.
+        self.current_label.sweep_provider = self._sweep_for_label
         layout.addWidget(self.current_label, stretch=1)
 
         self.next_label = QLabel("")
@@ -1288,6 +1610,26 @@ class OverlayWindow(QWidget):
                                 offset=self.engine.offset,
                                 sung_color=CRIMSON, unsung_color="#c9d1d9")
 
+    def _sweep_for_label(self):
+        """Smooth-sweep paint data for the overlay's current line.
+
+        Only when the line crossfade is idle: mid-fade the label is
+        showing the old line fading out, and the sweep must not jump
+        it to the new line early.
+        """
+        fader = getattr(self, "_current_fader", None)
+        if fader is not None and fader.busy:
+            return None
+        lyrics = self.engine.lyrics
+        if not lyrics or not lyrics.has_synced or not lyrics.has_word_sync:
+            return None
+        idx = self._current_idx
+        if idx < 0 or idx >= len(lyrics.synced_lines):
+            return None
+        return {"line": lyrics.synced_lines[idx],
+                "word_idx": self._current_word_idx,
+                "pos": self.engine.current_position() + self.engine.offset}
+
     def _on_fill_tick(self):
         """Mid-word sweep: re-render the current line's word fill from
         the interpolated position, ~16x/s. Skipped while a line
@@ -1314,6 +1656,11 @@ class OverlayWindow(QWidget):
                                 sung_color=CRIMSON, unsung_color="#c9d1d9")
         if html != self.current_label.text():
             self.current_label.setText(html)
+        # The smooth sweep paint reads the live position, not the
+        # label text — repaint every tick so the front moves
+        # continuously even while the HTML is unchanged (long held
+        # syllable).
+        self.current_label.update()
 
     def _on_position(self, pos, idx):
         lyrics = self.engine.lyrics

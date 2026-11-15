@@ -41,7 +41,10 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   Lyrics TTML carries syllable timings too, so the colour washes
   across a word mid-word, syllable by syllable, instead of the whole
   word snapping at once — the character the sweep is passing through
-  fades smoothly from dim to crimson as it's sung. Tracks without word timings fall back to
+  fades smoothly from dim to crimson as it's sung. The current line
+  is painted pixel-smooth with a soft edge and a crimson glow around
+  the sung part, so on a long held note the highlight glides
+  continuously instead of stepping letter by letter. Tracks without word timings fall back to
   line-only highlighting, exactly as before. `--demo` shows the
   effect on the sample lyrics.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay

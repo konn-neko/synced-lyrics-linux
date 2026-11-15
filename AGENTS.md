@@ -211,6 +211,25 @@ no login, no API keys.
   setText when the HTML actually changed; it never touches MPRIS — it
   reads the monotonic estimate between 250 ms polls, and line changes
   still go through `_highlight()` / the overlay crossfade.
+- Smooth sweep + glow (the pixel-smooth version of the above): HTML
+  can only flip whole characters, so on a long held syllable the
+  front visibly steps. The current line is therefore painted by
+  `_paint_sweep_text` (shared by the Full App delegate and the
+  overlay's `GlowWordLabel`): the front is a continuous pixel
+  position from `_sweep_front` (float char position in the line),
+  the sung text is drawn in crimson through a soft-edged alpha mask
+  (~8 px fade past the front) with low-opacity offset copies as a
+  glow, re-painted ~16x/s from the interpolated position. The
+  delegate gets its data from `FullAppWindow._sweep_for_row`, the
+  label from `OverlayWindow._sweep_for_label` (only while the line
+  crossfade is idle). Both windows' `_on_fill_tick` also force a
+  repaint every tick (viewport().update() / label.update()) so the
+  front moves even while the HTML is unchanged. CAUTION: a
+  `body { color: ... }` default stylesheet does NOT colour
+  QTextDocument text in Qt (it renders black) — colours are set via
+  QTextCursor char formats instead. The HTML path is still the
+  fallback for every other row, and the item text is still set to
+  the word HTML (tests + fallback).
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
   + LRCLIB, via `log_request(url, status, body)` in `_get_json` and
   `fetch_betterlyrics`; album-art fetches in `synced_lyrics.py`
