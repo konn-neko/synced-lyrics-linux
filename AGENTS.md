@@ -174,7 +174,19 @@ no login, no API keys.
 - Word-by-word highlight: pure helper `render_line_html(line, word_idx,
   sung_color, unsung_color)` in `synced_lyrics.py` (sung words crimson
   + bold, unsung dim / light grey, background words italic; no word
-  timings → plain escaped text, exactly line-only mode). Full App:
+  timings → plain escaped text, exactly line-only mode). **QLabel
+  renders this HTML natively, QListWidgetItem does NOT** — its default
+  delegate draws item text as plain text, so the Full App showed the
+  tags literally (`<span style=...>` on screen, William's screenshot).
+  The list therefore uses `LyricsItemDelegate` (QStyledItemDelegate +
+  QTextDocument paint/sizeHint, plain lines take the item foreground
+  as base colour so the highlight crossfade still works) with
+  `setWordWrap(True)` and no horizontal scrollbar. **Scroll mode:**
+  the list MUST be `setVerticalScrollMode(ScrollPerPixel)` — the
+  default ScrollPerItem measures the scrollbar in whole items, so the
+  pixel target SmoothScroller computes was clamped to the item count
+  and the list lurched between extremes (the up/down scroll bug that
+  survived the monotonic-position fix). Full App:
   `_highlight()` applies it on line change and restores the plain text
   on the previous line; `_on_position()` word-only updates call
   `_render_current_words()` and must NOT call `_highlight()` (that
