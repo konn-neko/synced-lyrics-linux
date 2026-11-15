@@ -6,8 +6,9 @@ Repo: https://github.com/konn-neko/synced-lyrics-linux
 ## What this is
 
 Native Linux synced-lyrics app, a BetterLyrics alternative for Linux.
-Reads what's playing via MPRIS, fetches time-synced lyrics from LRCLIB,
-shows them in a Full App window and/or a floating Overlay, with a system
+Reads what's playing via MPRIS, fetches word-synced lyrics from the
+Better Lyrics API (TTML) with LRCLIB line sync as fallback, shows them
+in a Full App window and/or a floating Overlay, with a system
 tray icon. Python 3 + PySide6 (Qt6), stdlib only for HTTP. No Electron,
 no login, no API keys.
 
@@ -17,9 +18,9 @@ no login, no API keys.
 |---|---|
 | `synced_lyrics.py` | Entry point + all UI: `FullAppWindow`, `OverlayWindow` (+ `ClickThroughHandle`), `AppController`, tray, display picker, CLI (`--mode`, `--screen`, `--demo`, `--test-lyrics`). |
 | `koneko_lyrics.py` | 3-line shim: imports `main` from `synced_lyrics.py`. Kept so the old `python3 koneko_lyrics.py` command still works. |
-| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, position interpolation, lyrics fetch in a worker thread. Both windows + tray render from it; never create a second poller. |
+| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, `MonotonicPosition` interpolated position (never goes backwards — see MPRIS), lyrics fetch in a worker thread (Better Lyrics TTML first, LRCLIB fallback). Both windows + tray render from it; never create a second poller. `word_index_at(pos)` gives the (line, word) active at a position. |
 | `mpris.py` | MPRIS client. Primary: `PySide6.QtDBus`. Fallback: `playerctl` CLI. `list_players()`, `get_track()`, `play_pause()`, `next_track()`, `previous_track()`, `seek()`. `TrackInfo` dataclass. |
-| `lyrics.py` | LRC parser + LRCLIB client + demo fixture. `parse_lrc()`, `fetch_lrclib()`, `LyricsResult`, `LyricLine`, `LRCLIBRateLimited`, `demo_result()`. |
+| `lyrics.py` | TTML + LRC parsers and both lyrics clients. `parse_ttml()`, `parse_lrc()` (incl. Enhanced-LRC word tags), `fetch_betterlyrics()`, `fetch_lrclib()`, `LyricsResult`, `LyricLine`, `LyricWord`, `LRCLIBRateLimited`, `demo_result()` (demo lines get proportional word timings so `--demo` shows word highlight). |
 | `test_lyrics.py` | Tests for `lyrics.py` only (no Qt needed). Runnable as `python3 test_lyrics.py` or `pytest`. |
 | `install.sh` | CachyOS/Arch one-command install: pacman `pyside6` + `playerctl`, launcher `~/.local/bin/synced-lyrics`, desktop file `~/.local/share/applications/synced-lyrics-linux.desktop`. |
 | `requirements.txt` | `PySide6>=6.6` — pip fallback only; prefer the distro package. |
@@ -39,11 +40,48 @@ no login, no API keys.
 - Browsers report position in 1 s steps. `PlaybackEngine` interpolates
   with `time.monotonic()` between 250 ms polls — do not poll faster
   than 250 ms to "fix" browser granularity; interpolation is the fix.
+- Monotonic position (`MonotonicPosition` in `playback.py`): browsers
+  report Position in 1 s steps, so a naive anchor reset sawtooths the
+  estimate back to the floored value on every poll — if a line boundary
+  falls in that window, `line_at()` flips back and forth and the scroll
+  glide gets retargeted forever. The anchor is adopted only when the
+  report is ahead of the estimate minus 0.5 s, or more than 2.0 s away
+  either way (a real seek); a report behind the estimate by more than
+  0.5 s is stale and ignored. `seek()` sets the anchor explicitly.
+  `_emit_position()` additionally clamps to the last emitted value
+  (`_emit_floor`, reset on seek / track change / player change) so
+  microsecond scheduling jitter can never flip the line index back.
+  Demo mode keeps its own position logic and is untouched by this.
 - If QtDBus fails / no players, fall back to `playerctl -l` and
   `playerctl --player <name> metadata --format …`. If neither works,
   the engine reports "No MPRIS player found" and keeps polling.
 
-## LRCLIB
+## Better Lyrics API (first provider)
+
+- Base: `https://api.betterlyrics.org`. Docs: https://lyrics-api-docs.boidu.dev
+- `GET /getLyrics?s=<title>&a=<artist>&al=<album>&d=<duration seconds>`
+  (all four params — the cache key includes album+duration, so missing
+  them usually misses the cache). 422 only if song+artist both missing.
+- Response: `{"ttml": "<xml...>", "score": 0.97}` (score only on fresh
+  fetches). TTML: `<p begin end>` per line, `<span begin end>` per
+  word/syllable. Times: `HH:MM:SS.mmm`, `M:SS.mmm`, or bare seconds
+  (`33.642`).
+- Cache-first, NO API KEY in this codebase, ever. Cached songs are
+  free; a cache miss without a key returns 401 and `fetch_betterlyrics`
+  returns None so the caller falls back to LRCLIB — the track never
+  fails for this. Keys are not being issued right now. 429 → return
+  None (fall back) rather than blocking; honour `Retry-After` by not
+  retrying. `/revalidate` needs a key and is not used.
+- The Kugou (`/kugou/getLyrics`) and QQ (`/qq/getLyrics`) endpoints
+  were checked live and are NOT wired in: they return
+  `{"lyrics": ..., "provider": ...}` — line-level LRC for Kugou, QRC
+  XML for QQ — not TTML. LRCLIB already covers line-level.
+- Cache: `~/.cache/synced-lyrics-linux/bl-<sha256>.json` (raw TTML +
+  `fetched_at`); cache reads re-parse identically, source
+  `"betterlyrics-cache"` (network: `"betterlyrics"`).
+- Only artist/title/album/duration are sent. Timeout 10 s.
+
+## LRCLIB (fallback provider)
 
 - Base: `https://lrclib.net`. No key, no account.
 - `GET /api/get?artist_name=&track_name=&album_name=&duration=`
@@ -62,15 +100,28 @@ no login, no API keys.
   `source="cache"`. Cache dir is gitignored — see "What NOT to do".
 - Only artist/title/album/duration are sent to LRCLIB. Nothing else.
 
-## LRC parsing rules (`lyrics.py: parse_lrc`)
+## LRC / TTML parsing rules (`lyrics.py`)
 
-- `[mm:ss.xx]` and `[mm:ss]`; `.x` = tenths, `.xx` = hundredths,
+- LRC: `[mm:ss.xx]` and `[mm:ss]`; `.x` = tenths, `.xx` = hundredths,
   `.xxx` = milliseconds.
-- Multiple timestamps per line → one `LyricLine` per timestamp, same text.
+- Multiple timestamps per line → one `LyricLine` per timestamp, same text
+  (word times shift by the tag difference for repeated lines).
 - `[offset:+/-ms]` shifts all lines; clamp negative results to 0.
 - Metadata tags (`[ti:]`, `[ar:]`, …) and blank lines are ignored.
-- Enhanced word tags `<mm:ss.xx>` are stripped; the line text is kept
-  and the line timestamp is used (line sync, not word sync).
+- Enhanced word tags `<mm:ss.xx>` are PARSED into `LyricLine.words`
+  (`LyricWord(time, end, text, is_background)`), not stripped: each
+  word's end is the next word's start, the last word's end is the next
+  line's start (last line: +3 s). A line with no word tags keeps
+  `words=[]` (line-only sync).
+- TTML (`parse_ttml`): `<p begin end>` → line, timed `<span>` →
+  word/syllable. Spans without `begin` are wrappers — recurse into
+  them, propagating `ttm:role="x-bg"` (background vocals). Whitespace
+  between spans IS the space between words: a span whose text ends in
+  whitespace, or whose tail holds whitespace, ends a word; spans with
+  neither continue the same word (syllables). Never pretty-print the
+  TTML — that destroys the inter-span whitespace.
+- `LyricsResult.has_word_sync` is true when any line has words;
+  `word_at(line_idx, pos, offset)` returns the active word index or -1.
 - Output is sorted by time. `LyricsResult.line_at(pos, offset)` returns
   the last line with `time <= pos + offset`, or -1.
 
@@ -120,6 +171,32 @@ no login, no API keys.
   `WA_TransparentForMouseEvents` (Qt6; Qt5: `WA_TransparentForInput`) + a separate `ClickThroughHandle` widget
   (the overlay itself ignores clicks in that mode, so the handle is
   the only way back — keep it).
+- Word-by-word highlight: pure helper `render_line_html(line, word_idx,
+  sung_color, unsung_color)` in `synced_lyrics.py` (sung words crimson
+  + bold, unsung dim / light grey, background words italic; no word
+  timings → plain escaped text, exactly line-only mode). Full App:
+  `_highlight()` applies it on line change and restores the plain text
+  on the previous line; `_on_position()` word-only updates call
+  `_render_current_words()` and must NOT call `_highlight()` (that
+  would restart the scroll glide). Overlay: line changes crossfade to
+  the word HTML via `LabelFader`; word-only updates set the label text
+  directly, but only when the fader is idle (`LabelFader.busy`) — a
+  skipped tick retries on the next 250 ms position tick. Engine side:
+  `PlaybackEngine.word_index_at(pos)` → (line_idx, word_idx) from the
+  same interpolated position; do not poll faster for words.
+- Single instance: `main()` takes a `QLockFile` at
+  `~/.config/synced-lyrics-linux/synced-lyrics.lock` (held on the app
+  object for the run; `tryLock(0)` — PySide6 requires the timeout arg;
+  stale locks from crashed runs are reclaimed by Qt). A second launch
+  connects via `QLocalSocket` to the first instance's `QLocalServer`
+  (`"synced-lyrics-linux"`), which raises its Full App, and the second
+  process exits 0. `--test-lyrics` returns before the lock (CLI mode
+  must not take it). Closing the window still minimises to tray — the
+  guard, not a behaviour change, stops the pile-up of tray icons.
+- Clean quit: `AppController.quit_app()` hides the tray icon, overlay,
+  click-through handle and Full App window, then `engine.stop()` and
+  `app.quit()`; `aboutToQuit` also hides everything, so no ghost ♪
+  stays in the KDE panel after quit from any path.
 - Tray: `QSystemTrayIcon`, icon drawn in code (`make_tray_icon`, a `♪`
   on a crimson disc). Guard with `isSystemTrayAvailable()` — headless /
   tray-less sessions must still run. Double-click toggles Full App.
@@ -136,14 +213,16 @@ no login, no API keys.
 - Config: `~/.config/synced-lyrics-linux/config.json`
   (offset, font_size, display, minimise_to_tray, overlay_opacity,
   overlay_click_through, line_animations, last_player).
-- Lyrics cache: `~/.cache/synced-lyrics-linux/*.json`.
+- Lyrics cache: `~/.cache/synced-lyrics-linux/*.json` — LRCLIB records
+  as `<sha256>.json`, Better Lyrics TTML as `bl-<sha256>.json`.
 - Album art cache: `~/.cache/synced-lyrics-linux/art/`.
 
 ## How to run tests headless
 
 ```bash
-python3 -m py_compile synced_lyrics.py koneko_lyrics.py lyrics.py mpris.py playback.py test_lyrics.py
-python3 test_lyrics.py            # LRC + live LRCLIB (SKIP if offline, never fails for no network)
+python3 -m py_compile synced_lyrics.py koneko_lyrics.py lyrics.py mpris.py playback.py test_lyrics.py test_ui_smoke.py
+python3 test_lyrics.py            # LRC/TTML parse + live Better Lyrics + live LRCLIB (live tests SKIP when offline or uncached, never fail for no network)
+QT_QPA_PLATFORM=offscreen /tmp/lyrics-venv/bin/python test_ui_smoke.py   # animation helpers, render_line_html, MonotonicPosition, single-instance lock + local server, demo word highlight
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo
@@ -158,9 +237,11 @@ offscreen has one virtual display, so `--screen 1` falls back to primary.
 ## How to add a lyrics provider
 
 1. Add a `fetch_<provider>()` in `lyrics.py` returning `LyricsResult`
-   (or `None`), same shape as `fetch_lrclib()`.
-2. Call it from `playback.py: _LyricsWorker.fetch` as a fallback chain
-   (LRCLIB first, then the new provider) — keep LRCLIB first.
+   (or `None`), same shape as `fetch_betterlyrics()` / `fetch_lrclib()`.
+2. Call it from `playback.py: _LyricsWorker.fetch` in the chain
+   (Better Lyrics TTML first, LRCLIB second — keep that order unless
+   the new provider has word sync and a keyless cache-first model).
+   A provider that returns None on 401/429 must never fail the track.
 3. Set `result.source` to the provider name so the status bar is honest.
 4. Add a parser test in `test_lyrics.py` if the format differs from LRC.
 5. Document the provider, its rate limits, and whether it needs a key

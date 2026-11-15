@@ -6,7 +6,8 @@ never loses sync. The engine owns:
   * the selected MPRIS player (or demo mode)
   * position polling every 250 ms, interpolated with a monotonic clock
     (browsers report position in 1 s steps, so interpolation matters)
-  * the current LyricsResult, fetched in a worker thread from LRCLIB
+  * the current LyricsResult, fetched in a worker thread — Better
+    Lyrics TTML (word sync) first, LRCLIB line sync as fallback
   * sync offset (seconds, added to the position before line lookup)
 """
 from __future__ import annotations
@@ -16,7 +17,57 @@ import time
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 import mpris
-from lyrics import LRCLIBRateLimited, LyricsResult, demo_result, fetch_lrclib
+from lyrics import (
+    LRCLIBRateLimited,
+    LyricsResult,
+    demo_result,
+    fetch_betterlyrics,
+    fetch_lrclib,
+)
+
+
+class MonotonicPosition:
+    """Interpolated position that never goes backwards.
+
+    Browsers (YouTube Music in Firefox/Chromium) report MPRIS Position
+    in 1 s steps, so the reported value stays flat for ~4 polls and then
+    jumps a whole second. Naively resetting the interpolation anchor to
+    each report makes the estimate sawtooth back to the floored value
+    on every poll — and if a line boundary falls inside that window,
+    line_at() flips between two lines on every poll and the scroll
+    animation gets retargeted up and down forever.
+
+    Instead, keep an anchor (position + monotonic time it was set) and
+    interpolate from it while Playing. A new report is adopted as the
+    anchor when it is ahead of the estimate minus a small tolerance
+    (normal advance / jitter), or when it is far away either way
+    (a real seek). A report behind the estimate by more than the
+    tolerance is a stale/floored report and is ignored, so the estimate
+    never goes backwards.
+    """
+
+    STALE_TOLERANCE = 0.5  # s: ignore reports this far behind the estimate
+    SEEK_JUMP = 2.0        # s: a jump this big either way is a real seek
+
+    def __init__(self):
+        self.anchor = 0.0
+        self.anchor_time: float | None = None
+
+    def estimate(self, now: float, playing: bool = True) -> float:
+        if self.anchor_time is None or not playing:
+            return self.anchor
+        return self.anchor + (now - self.anchor_time)
+
+    def observe(self, reported: float, now: float, playing: bool = True) -> float:
+        est = self.estimate(now, playing)
+        if reported >= est - self.STALE_TOLERANCE or abs(reported - est) > self.SEEK_JUMP:
+            self.anchor = float(reported)
+            self.anchor_time = now
+        return self.estimate(now, playing)
+
+    def set(self, position: float, now: float) -> None:
+        self.anchor = float(position)
+        self.anchor_time = now
 
 
 class _LyricsWorker(QObject):
@@ -29,7 +80,13 @@ class _LyricsWorker(QObject):
 
     def fetch(self, artist, track, album, duration, key):
         try:
-            result = fetch_lrclib(artist, track, album, duration)
+            # Provider order: Better Lyrics TTML (word sync) first,
+            # LRCLIB line sync as fallback. fetch_betterlyrics returns
+            # None on 401 (uncached, no key) / 429 / network error —
+            # the track never fails for it, it just falls back.
+            result = fetch_betterlyrics(artist, track, album, duration)
+            if result is None:
+                result = fetch_lrclib(artist, track, album, duration)
             self.result_ready.emit((key, result))
         except LRCLIBRateLimited as e:
             self.result_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -53,7 +110,8 @@ class PlaybackEngine(QObject):
         self.track = mpris.TrackInfo()
         self.lyrics: LyricsResult | None = None
         self.offset: float = 0.0
-        self._last_pos = 0.0
+        self._pos = MonotonicPosition()
+        self._emit_floor: float | None = None
         self._last_poll = time.monotonic()
         self._demo_start = time.monotonic()
         self._demo_pos = 0.0
@@ -96,6 +154,7 @@ class PlaybackEngine(QObject):
             self.track = mpris.TrackInfo(player=player)
             self.lyrics = None
             self._fetch_key = None
+            self._emit_floor = None
             self.lyrics_changed.emit(None)
             self.poll()
 
@@ -154,7 +213,9 @@ class PlaybackEngine(QObject):
         if track is None:
             self.status_changed.emit(f"Player '{self.player}' stopped responding")
             return
-        self._last_pos = track.position
+        # Monotonic anchor: a floored browser report must not drag the
+        # interpolated estimate backwards (see MonotonicPosition).
+        self._pos.observe(track.position, now, playing=(track.status == "Playing"))
         changed = track.key != self.track.key
         self.track = track
         if changed:
@@ -165,15 +226,23 @@ class PlaybackEngine(QObject):
     def _emit_position(self):
         if self.demo:
             pos = self._demo_pos
-        elif self.track.status == "Playing":
-            pos = self._last_pos + (time.monotonic() - self._last_poll)
         else:
-            pos = self._last_pos
+            pos = self._pos.estimate(
+                time.monotonic(), playing=(self.track.status == "Playing"))
+            # Belt-and-braces monotonicity: microsecond scheduling jitter
+            # between observe() and estimate() can make consecutive
+            # emissions differ by ~1e-5 s in either direction. Clamp to
+            # the last emitted value so the line index can never flip
+            # back within a track. Seeks / track changes reset the floor.
+            if self._emit_floor is not None:
+                pos = max(pos, self._emit_floor)
+            self._emit_floor = pos
         idx = self.lyrics.line_at(pos, self.offset) if self.lyrics else -1
         self.position_changed.emit(pos, idx)
 
     # -------------------------------------------------------------- lyrics
     def _fetch_lyrics(self, track):
+        self._emit_floor = None  # new track: positions may start lower
         if not track.title or not track.artist:
             self.lyrics = None
             self.lyrics_changed.emit(None)
@@ -196,18 +265,43 @@ class PlaybackEngine(QObject):
         self.lyrics = result
         self.lyrics_changed.emit(result)
         if result is None:
-            self.status_changed.emit("No lyrics found on LRCLIB for this track")
+            self.status_changed.emit("No lyrics found (Better Lyrics + LRCLIB) for this track")
         elif result.instrumental:
             self.status_changed.emit("Instrumental — no lyrics (LRCLIB)")
         elif result.has_synced:
-            self.status_changed.emit(
-                f"Synced lyrics from LRCLIB ({len(result.synced_lines)} lines)"
-                + (" [cached]" if result.source == "cache" else ""))
+            if result.has_word_sync:
+                provider = ("Better Lyrics" if result.source.startswith("betterlyrics")
+                            else "LRCLIB")
+                self.status_changed.emit(
+                    f"Word-synced lyrics from {provider} ({len(result.synced_lines)} lines)"
+                    + (" [cached]" if "cache" in result.source else ""))
+            elif result.source.startswith("betterlyrics"):
+                self.status_changed.emit(
+                    f"Synced lyrics from Better Lyrics ({len(result.synced_lines)} lines)"
+                    + (" [cached]" if "cache" in result.source else ""))
+            else:
+                self.status_changed.emit(
+                    f"Synced lyrics from LRCLIB ({len(result.synced_lines)} lines)"
+                    + (" [cached]" if result.source == "cache" else ""))
         elif result.plain_lyrics:
-            self.status_changed.emit("Plain lyrics only — no sync data (LRCLIB)")
+            self.status_changed.emit("Plain lyrics only — no sync data")
         else:
-            self.status_changed.emit("No lyrics found on LRCLIB for this track")
+            self.status_changed.emit("No lyrics found (Better Lyrics + LRCLIB) for this track")
         self._emit_position()
+
+    def word_index_at(self, pos: float) -> tuple[int, int]:
+        """(line_idx, word_idx) active at `pos` (offset applied).
+
+        Word index is -1 when the line has no word timings. Uses the
+        same 250 ms interpolated position as the line lookup — no
+        faster polling is needed for word highlighting.
+        """
+        if not self.lyrics:
+            return (-1, -1)
+        line_idx = self.lyrics.line_at(pos, self.offset)
+        if line_idx < 0:
+            return (-1, -1)
+        return (line_idx, self.lyrics.word_at(line_idx, pos, self.offset))
 
     def search_manual(self, artist: str, track: str):
         """Manual lookup from the search box: pretends this is the track."""
@@ -246,15 +340,16 @@ class PlaybackEngine(QObject):
             return
         if self.player:
             mpris.seek(self.player, seconds)
-            self._last_pos = seconds
-            self._last_poll = time.monotonic()
+            self._pos.set(seconds, time.monotonic())
+            self._emit_floor = None  # a seek may legitimately go backwards
             self._emit_position()
 
     @property
     def current_line_index(self) -> int:
         if not self.lyrics:
             return -1
-        pos = self._demo_pos if self.demo else self._last_pos
+        pos = self._demo_pos if self.demo else self._pos.estimate(
+            time.monotonic(), playing=(self.track.status == "Playing"))
         return self.lyrics.line_at(pos, self.offset)
 
     @property

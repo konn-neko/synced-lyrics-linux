@@ -3,8 +3,9 @@
 
 Repo: https://github.com/konn-neko/synced-lyrics-linux
 A BetterLyrics-style app for Linux: reads what's playing via MPRIS
-(Spotify, YouTube Music in a browser, VLC, ...), fetches time-synced
-lyrics from LRCLIB (free, no key, no login), and shows them in sync.
+(Spotify, YouTube Music in a browser, VLC, ...), fetches word-synced
+lyrics from the Better Lyrics API (TTML, cache-first, no key) with
+LRCLIB line sync as fallback, and shows them in sync.
 
 Modes (one shared PlaybackEngine, so switching never loses sync):
   * Full App  -- a normal resizable window (Ctrl+1)
@@ -18,12 +19,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import sys
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
+from PySide6.QtCore import (
+    QEasingCurve, QLockFile, QPropertyAnimation, Qt, QTimer, QUrl,
+)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout,
@@ -40,6 +45,8 @@ APP_NAME = "synced-lyrics-linux"
 REPO_URL = "https://github.com/konn-neko/synced-lyrics-linux"
 CONFIG_DIR = Path.home() / ".config" / "synced-lyrics-linux"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOCK_FILE = CONFIG_DIR / "synced-lyrics.lock"
+SERVER_NAME = "synced-lyrics-linux"  # QLocalServer name for raise-existing
 ART_CACHE = Path.home() / ".cache" / "synced-lyrics-linux" / "art"
 
 # Qt6 renamed WA_TransparentForInput -> WA_TransparentForMouseEvents.
@@ -199,6 +206,33 @@ def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
         round(c1.blue() + (c2.blue() - c1.blue()) * t))
 
 
+def render_line_html(line, word_idx: int,
+                     sung_color: str = CRIMSON,
+                     unsung_color: str = DIM) -> str:
+    """HTML for one lyric line with words up to `word_idx` sung.
+
+    Pure helper (no Qt widgets) so tests can cover it without windows.
+    Words 0..word_idx are sung (sung colour, bold); the rest are
+    unsung. Background-vocal words render italic. Lines without word
+    timings return their plain text, HTML-escaped — exactly today's
+    line-only rendering. QListWidgetItem and QLabel both render this
+    rich text.
+    """
+    text = html.escape(line.text)
+    if not line.words:
+        return text
+    parts = []
+    for i, word in enumerate(line.words):
+        sung = 0 <= word_idx and i <= word_idx
+        color = sung_color if sung else unsung_color
+        style = f"color:{color};"
+        style += "font-weight:bold;" if sung else "font-weight:normal;"
+        if word.is_background:
+            style += "font-style:italic;"
+        parts.append(f'<span style="{style}">{html.escape(word.text)}</span>')
+    return " ".join(parts)
+
+
 class SmoothScroller:
     """Animate a QScrollBar's value to a target instead of jumping.
 
@@ -257,6 +291,13 @@ class LabelFader:
         self._state = "idle"  # idle | out | in
         self._pending = None
         self._ignore_finished = False
+
+    @property
+    def busy(self) -> bool:
+        """True while a crossfade is in flight. Word-only updates
+        (same line, new word) must wait for idle and set the label
+        text directly, or the fader would land on stale text."""
+        return self._state != "idle"
 
     def show_text(self, text, enabled=True):
         if not enabled:
@@ -337,6 +378,7 @@ class FullAppWindow(QMainWindow):
         self.resize(900, 650)
         self._dragging_slider = False
         self._current_idx = -2
+        self._current_word_idx = -2
         self._art_url = ""
 
         central = QWidget(self)
@@ -573,6 +615,7 @@ class FullAppWindow(QMainWindow):
         self._fade_step = 0
         self.lyrics_list.clear()
         self._current_idx = -2
+        self._current_word_idx = -2
         if lyrics is None:
             item = QListWidgetItem("No lyrics for this track — try the manual search above.")
             item.setForeground(QColor(DIM))
@@ -607,10 +650,20 @@ class FullAppWindow(QMainWindow):
                 self.slider.setValue(int(pos / track.duration * 1000))
             self.total_label.setText(fmt_time(track.duration))
         self.play_btn.setText("⏸" if track.status == "Playing" else "▶")
-        if idx != self._current_idx and self.engine.lyrics and self.engine.lyrics.has_synced:
-            self._highlight(idx)
+        if not self.engine.lyrics or not self.engine.lyrics.has_synced:
+            return
+        if idx != self._current_idx:
+            self._highlight(idx, pos)
+            return
+        # Same line: only the word may have changed. Update the word
+        # highlight in place — this must NOT call _highlight(), or the
+        # scroll glide would restart on every word.
+        line_idx, word_idx = self.engine.word_index_at(pos)
+        if word_idx != self._current_word_idx and line_idx == idx:
+            self._current_word_idx = word_idx
+            self._render_current_words()
 
-    def _highlight(self, idx):
+    def _highlight(self, idx, pos=None):
         # Land any in-flight colour fade on its final colours first, so
         # a fast run of line changes never leaves a stale colour behind.
         self._finish_fade()
@@ -623,7 +676,17 @@ class FullAppWindow(QMainWindow):
             f.setPointSize(self.cfg["font_size"])
             f.setBold(False)
             prev_item.setFont(f)
+            # Restore the plain line text: it may carry word HTML
+            # from when it was the current line.
+            lyrics = self.engine.lyrics
+            if lyrics and 0 <= prev < len(lyrics.synced_lines):
+                prev_item.setText(lyrics.synced_lines[prev].text)
         self._current_idx = idx
+        self._current_word_idx = -2
+        if pos is not None and self.engine.lyrics:
+            line_idx, widx = self.engine.word_index_at(pos)
+            if line_idx == idx:
+                self._current_word_idx = widx
         if not (0 <= idx < self.lyrics_list.count()):
             if prev_item is not None:
                 prev_item.setForeground(QColor(DIM))
@@ -648,6 +711,9 @@ class FullAppWindow(QMainWindow):
             if prev_item is not None:
                 prev_item.setForeground(QColor(DIM))
             item.setForeground(QColor(CRIMSON))
+        # Word-by-word: render the current line's words (sung words
+        # crimson, rest dim). Plain text for lines without timings.
+        self._render_current_words()
         # Smooth-scroll: glide the new line to the centre (~350ms,
         # OutCubic) instead of scrollToItem's instant jump. The target
         # is computed from the item rect AFTER the font change, so row
@@ -658,6 +724,22 @@ class FullAppWindow(QMainWindow):
         target = (rect.top() + bar.value() + rect.height() // 2
                   - self.lyrics_list.viewport().height() // 2)
         self._scroller.scroll_to(target, enabled=animated)
+
+    def _render_current_words(self):
+        """Apply word-by-word HTML to the current line's list item.
+
+        Lines without word timings keep their plain text, so line-only
+        tracks render exactly as before.
+        """
+        idx = self._current_idx
+        if not (0 <= idx < self.lyrics_list.count()):
+            return
+        lyrics = self.engine.lyrics
+        if not lyrics or idx >= len(lyrics.synced_lines):
+            return
+        item = self.lyrics_list.item(idx)
+        item.setText(render_line_html(
+            lyrics.synced_lines[idx], self._current_word_idx))
 
     def _on_fade_tick(self):
         self._fade_step += 1
@@ -772,6 +854,7 @@ class OverlayWindow(QWidget):
         self.resize(640, 190)
         self._drag_pos = None
         self._current_idx = -2
+        self._current_word_idx = -2
         self._next_text = ""
 
         layout = QVBoxLayout(self)
@@ -922,6 +1005,7 @@ class OverlayWindow(QWidget):
 
     def _on_lyrics(self, lyrics):
         self._current_idx = -2
+        self._current_word_idx = -2
         animated = bool(self.cfg.get("line_animations", True))
         if lyrics is None or not lyrics.has_synced:
             self._current_fader.show_text(
@@ -930,6 +1014,16 @@ class OverlayWindow(QWidget):
             return
         self._on_position(0.0, -1)
 
+    def _current_line_html(self, idx, pos):
+        """Current line rendered with word-by-word highlight at `pos`."""
+        lyrics = self.engine.lyrics
+        if lyrics is None or not (0 <= idx < len(lyrics.synced_lines)):
+            return ""
+        _, word_idx = self.engine.word_index_at(pos)
+        self._current_word_idx = word_idx
+        return render_line_html(lyrics.synced_lines[idx], word_idx,
+                                sung_color=CRIMSON, unsung_color="#c9d1d9")
+
     def _on_position(self, pos, idx):
         lyrics = self.engine.lyrics
         track = self.engine.track
@@ -937,8 +1031,22 @@ class OverlayWindow(QWidget):
         if not lyrics or not lyrics.has_synced:
             return
         if idx == self._current_idx:
+            # Same line: only the word may have changed. Update the
+            # label directly — never re-trigger the line crossfade.
+            # If a fade is in flight, skip this tick; the next 250 ms
+            # tick retries once the fader is idle.
+            _, word_idx = self.engine.word_index_at(pos)
+            if (word_idx != self._current_word_idx
+                    and not self._current_fader.busy):
+                self._current_word_idx = word_idx
+                if idx >= 0:
+                    self.current_label.setText(
+                        render_line_html(lyrics.synced_lines[idx], word_idx,
+                                         sung_color=CRIMSON,
+                                         unsung_color="#c9d1d9"))
             return
         self._current_idx = idx
+        self._current_word_idx = -2
         animated = bool(self.cfg.get("line_animations", True))
         if idx < 0:
             self._current_fader.show_text("♪", enabled=animated)
@@ -946,8 +1054,10 @@ class OverlayWindow(QWidget):
                 lyrics.synced_lines[0].text if lyrics.synced_lines else "",
                 enabled=animated)
         else:
+            # Line change: crossfade to the word-highlighted line, so
+            # the fade lands on the correct words at once.
             self._current_fader.show_text(
-                lyrics.synced_lines[idx].text, enabled=animated)
+                self._current_line_html(idx, pos), enabled=animated)
             nxt = lyrics.synced_lines[idx + 1].text if idx + 1 < len(lyrics.synced_lines) else ""
             self._next_fader.show_text(nxt, enabled=animated)
 
@@ -968,6 +1078,7 @@ class AppController:
             save_config(self.cfg)
         self.engine = PlaybackEngine(demo=demo)
         app.aboutToQuit.connect(self.engine.stop)
+        app.aboutToQuit.connect(self._hide_all)
         self.engine.set_offset(float(self.cfg.get("offset", 0.0)))
         if self.cfg.get("last_player"):
             self.engine.set_player(self.cfg["last_player"])
@@ -1097,8 +1208,32 @@ class AppController:
             act.setChecked(bool(enabled))
 
     def quit_app(self):
+        # Hide everything first, tray icon included: otherwise KDE
+        # keeps a ghost ♪ in the panel after the process is gone.
+        self._hide_all()
         self.engine.stop()
         self.app.quit()
+
+    def _hide_all(self):
+        """Hide every visible piece (tray icon, windows, handle).
+
+        Also connected to aboutToQuit as belt-and-braces, so a quit
+        from any path removes the tray icon instead of leaving a ghost.
+        Guards with getattr: aboutToQuit can fire before __init__
+        finishes setting these attributes.
+        """
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
+        overlay = getattr(self, "overlay", None)
+        if overlay is not None:
+            overlay.hide()
+            handle = getattr(overlay, "handle", None)
+            if handle is not None:
+                handle.hide()
+        full = getattr(self, "full", None)
+        if full is not None:
+            full.hide()
 
 
 # ---------------------------------------------------------------------- CLI
@@ -1138,16 +1273,55 @@ def test_lyrics_cli(artist: str, title: str) -> int:
     return 0
 
 
+def _raise_existing_window() -> bool:
+    """Ask a running instance to show its window. True if one answered.
+
+    A second `synced-lyrics` launch connects to the first instance's
+    QLocalServer and exits; the first instance raises its Full App.
+    """
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(b"show")
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.test_lyrics:
         return test_lyrics_cli(args.test_lyrics[0], args.test_lyrics[1])
 
+    # Single instance: closing the window only minimises to tray, so
+    # without this every fresh launch piled up another live process
+    # (and another ♪ in the KDE panel). The lock lives on the app
+    # object so it is held for the whole run; QLockFile releases a
+    # stale lock if a previous run crashed.
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(LOCK_FILE))
+    if not lock.tryLock(0):
+        if _raise_existing_window():
+            print("synced-lyrics is already running — showing the existing window")
+        else:
+            print("synced-lyrics is already running (could not reach it to raise the window)")
+        return 0
+
     app = QApplication(sys.argv if argv is None else [sys.argv[0]])
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(make_tray_icon())
+    app._single_instance_lock = lock  # keep the lock held for the run
     controller = AppController(app, demo=args.demo, mode=args.mode,
                                screen_choice=args.screen)
+    # First instance also listens: a later launch asks us to raise.
+    server = QLocalServer()
+    QLocalServer.removeServer(SERVER_NAME)  # stale socket file, if any
+    if server.listen(SERVER_NAME):
+        server.newConnection.connect(
+            lambda: (server.nextPendingConnection().deleteLater()
+                     if server.hasPendingConnections() else None,
+                     controller.show_full()))
     return app.exec()
 
 

@@ -10,9 +10,10 @@
 
 BetterLyrics is Windows-only (WinUI 3, Windows Media Transport Controls).
 On Linux the same job is actually easier: every player already publishes
-what's playing over **MPRIS**, and **LRCLIB** serves time-synced lyrics
-for free with no key and no login. This app glues those two together in a
-native Qt6 window — no Electron, no account, no API key.
+what's playing over **MPRIS**, and **Better Lyrics** serves word-synced
+lyrics (TTML, cache-first, no key) with **LRCLIB** as the line-sync
+fallback. This app glues those together in a native Qt6 window — no
+Electron, no account, no API key.
 
 ## Screenshots
 
@@ -34,6 +35,11 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   line (~350ms smooth scroll) while the highlight colour crossfades
   (~150ms). Turn it off in `View > Smooth line animations` (or
   `"line_animations": false` in the config) for the old instant swap.
+- **Word-by-word karaoke** — when a track has word timings, words
+  light up one by one in crimson as they're sung (Full App list and
+  Overlay alike), instead of the whole line flipping at once. Tracks
+  without word timings fall back to line-only highlighting, exactly
+  as before. `--demo` shows the effect on the sample lyrics.
 - **Overlay mode** — frameless, always-on-top, translucent. Shows the
   current line large + the next line dimmed, with track title/artist and
   play/pause controls. Lines crossfade on change (~150ms out, ~250ms in)
@@ -157,6 +163,8 @@ Spotify / YouTube Music / VLC
         ▼
 PlaybackEngine  (one poller, 250 ms, position interpolated
         │       with a monotonic clock between polls)
+        ├─► Better Lyrics  GET /getLyrics?s=&a=&al=&d=  (TTML, word sync)
+        │           (cache-first, no key; 401/429 → fall back)
         ├─► LRCLIB  GET /api/get?artist_name=&track_name=&album_name=&duration=
         │           (fallback /api/search; cached in ~/.cache/synced-lyrics-linux/)
         ▼
@@ -166,25 +174,54 @@ Full App window  ⇄  Overlay window  ⇄  System tray
 
 - **MPRIS:** the standard Linux media-player interface. Primary path is
   `PySide6.QtDBus`; if that fails, `playerctl` is used. Browsers report
-  position in 1-second steps, so the engine interpolates between polls.
+  position in 1-second steps, so the engine interpolates between polls
+  with a monotonic anchor — a floored report can never drag the estimate
+  backwards, so the current line can't flip back and forth.
+- **Better Lyrics:** `https://api.betterlyrics.org/getLyrics` returns
+  `{"ttml": "..."}` — TTML with a start/end time for every word, which
+  is what powers word-by-word highlighting. Cache-first and free: songs
+  already cached need no API key at all, and this app never sends one.
+  A cache miss without a key returns 401 (keys aren't being issued
+  right now) — the app just falls back to LRCLIB instead of failing
+  the track. The Kugou/QQ provider endpoints were checked and are NOT
+  used: they return line-level LRC / QRC, not TTML. Docs:
+  https://lyrics-api-docs.boidu.dev
 - **LRCLIB:** `https://lrclib.net/api/get` returns `syncedLyrics` (LRC),
   `plainLyrics`, `instrumental`, `duration`. No key; the client sends
   `Lrclib-Client: synced-lyrics-linux/1.0`. Rate limits (~45 req/min
   generic, ~90/min identified) are honoured — a 429 shows
   "rate limited — retry in Ns" instead of hammering the API.
-- **LRC parsing:** `[mm:ss.xx]` / `[mm:ss]`, multiple timestamps per
-  line, `[offset:]`, enhanced `<mm:ss.xx>` word tags (stripped to line
-  text). See [AGENTS.md](AGENTS.md) for the full rules.
+- **Lyric parsing:** TTML `<p>` lines / `<span>` words (whitespace
+  between spans is the space between words — never pretty-printed);
+  LRC `[mm:ss.xx]` / `[mm:ss]`, multiple timestamps per line,
+  `[offset:]`, and enhanced `<mm:ss.xx>` word tags (parsed into
+  per-word timings, e.g. from a BetterLyrics `.lrc` export). See
+  [AGENTS.md](AGENTS.md) for the full rules.
 
 Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Lyrics sources
+
+| Source | Sync level | Key? | When it's used |
+|---|---|---|---|
+| Better Lyrics API (`api.betterlyrics.org`) | Word / syllable (TTML) | No — cache-first, cached songs are free | First, for every track |
+| LRCLIB (`lrclib.net`) | Line (LRC) | No | Fallback when Better Lyrics 401s, 429s, or has no match |
+
+The status bar always names the real source, e.g. "Word-synced lyrics
+from Better Lyrics (38 lines)" or "Synced lyrics from LRCLIB (37
+lines)", with `[cached]` when the lyrics came from the disk cache
+(`~/.cache/synced-lyrics-linux/`, `bl-` prefix for Better Lyrics
+entries). Only artist/title/album/duration are ever sent to either
+service. Lyrics are fetched at runtime and never shipped with the repo.
+
 ## Limitations
 
-- **Lyrics coverage depends on LRCLIB.** Not every track has synced
-  lyrics; some have plain lyrics only, some have none. The app says so
-  plainly ("No synced lyrics for this track") instead of guessing.
-- **Line sync only.** LRCLIB is mostly line-timed; word-by-word karaoke
-  needs enhanced timings that most tracks don't have.
+- **Lyrics coverage depends on both providers.** Not every track has
+  synced lyrics; some have plain lyrics only, some have none. The app
+  says so plainly ("No lyrics found") instead of guessing.
+- **Word sync needs word timings.** Only tracks with TTML word data
+  (Better Lyrics) or Enhanced-LRC word tags get word-by-word
+  highlighting; everything else is line-only, which still works fine.
 - **Sync can be off by a second or two** on some tracks — use the
   Sync `−0.5s` / `+0.5s` buttons; the offset is saved.
 - **Browsers report position in 1 s steps** — the app interpolates, so
@@ -203,8 +240,9 @@ Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | "No MPRIS player found" | Start Spotify / YouTube Music and press play once. Check the player actually exposes MPRIS: `playerctl -l` should list it. |
 | `./install.sh` is not executable / Permission denied | Run `chmod +x install.sh` first, then `./install.sh` — or just `bash install.sh`. A fresh clone loses the executable bit. |
 | `synced-lyrics` command not found | `install.sh` never ran (see above) — it creates the `~/.local/bin/synced-lyrics` launcher. Run it, then open a new shell so `~/.local/bin` is on your `PATH`. |
-| Lyrics never load | Check network to `lrclib.net`, and try `--test-lyrics "Coldplay" "Yellow"` — if that works, the track just isn't in LRCLIB. |
+| Lyrics never load | Check network to `api.betterlyrics.org` and `lrclib.net`, and try `--test-lyrics "Coldplay" "Yellow"` — if that works, the track just isn't in either source. |
 | Wrong lyrics for a track | LRCLIB matched by title/artist/duration. Use the manual search box (`Artist — Title`) to try a different spelling. |
+| Multiple identical ♪ icons in the panel | Old instances from before the single-instance guard: quit them (right-click each icon → Quit) or `pkill -f synced_lyrics.py`, then launch once — a second launch now just raises the running window instead of starting another copy. |
 | Overlay won't come back | Right-click the tray icon → Show Full App, or `Ctrl+1` in the Full App. If click-through is on, click the `◉` handle. |
 | App doesn't start | `python3 synced_lyrics.py --demo` — if that works, the problem is MPRIS/player detection, not the app. Run `python3 -m py_compile synced_lyrics.py lyrics.py mpris.py playback.py` to check for syntax errors. |
 | Tray icon missing | Some Wayland sessions hide tray icons; the app still works from the Full App window. This is a tray icon, not a plasmoid — see `docs/ARCHITECTURE.md`. |
@@ -230,5 +268,5 @@ or API keys.
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright William / konn-neko, 2026.
-Lyrics themselves are fetched at runtime from LRCLIB and are not
-shipped with this repo.
+Lyrics themselves are fetched at runtime from Better Lyrics and LRCLIB
+and are not shipped with this repo.
