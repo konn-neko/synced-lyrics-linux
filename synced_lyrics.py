@@ -26,15 +26,19 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve, QLockFile, QPropertyAnimation, Qt, QTimer, QUrl,
+    QEasingCurve, QLockFile, QPropertyAnimation, QSize, Qt, QTimer, QUrl,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import (
+    QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSizeGrip, QSlider, QStyle, QSystemTrayIcon,
-    QVBoxLayout, QWidget, QWidgetAction,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog,
+    QGraphicsOpacityEffect, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSizeGrip,
+    QSlider, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QSystemTrayIcon, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 import mpris
@@ -215,8 +219,10 @@ def render_line_html(line, word_idx: int,
     Words 0..word_idx are sung (sung colour, bold); the rest are
     unsung. Background-vocal words render italic. Lines without word
     timings return their plain text, HTML-escaped — exactly today's
-    line-only rendering. QListWidgetItem and QLabel both render this
-    rich text.
+    line-only rendering. QLabel renders this rich text natively;
+    QListWidgetItem does NOT (its default delegate shows the tags
+    literally — seen on William's box), so the Full App list paints it
+    with LyricsItemDelegate below.
     """
     text = html.escape(line.text)
     if not line.words:
@@ -231,6 +237,60 @@ def render_line_html(line, word_idx: int,
             style += "font-style:italic;"
         parts.append(f'<span style="{style}">{html.escape(word.text)}</span>')
     return " ".join(parts)
+
+
+class LyricsItemDelegate(QStyledItemDelegate):
+    """Paint list items as rich text with a QTextDocument.
+
+    QListWidget's default delegate draws item text as plain text, so
+    the word-by-word HTML from render_line_html() showed up literally
+    on screen ("<span style=...>Ooh,</span>"). This delegate paints
+    the HTML instead, sizes each row from the document so long lines
+    wrap at the viewport width (no horizontal scrollbar), and keeps
+    the default selection/focus background. Plain lines (no HTML) get
+    the item's foreground colour as their base colour, so the
+    highlight crossfade (which only changes the foreground) still
+    works. Row heights are re-queried whenever an item's text changes
+    (every word tick / line change), so resizing the window reflows
+    rows as lyrics update.
+    """
+
+    def _document(self, option, index):
+        doc = QTextDocument()
+        doc.setDocumentMargin(2)
+        doc.setDefaultFont(option.font)
+        fg = option.palette.text().color()
+        doc.setDefaultStyleSheet(f"body {{ color: {fg.name()}; }}")
+        doc.setHtml(index.data(Qt.DisplayRole) or "")
+        return doc
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""  # background only here; the document draws the text
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
+        doc = self._document(opt, index)
+        doc.setTextWidth(max(1, opt.rect.width()))
+        painter.save()
+        painter.translate(opt.rect.topLeft())
+        y = (opt.rect.height() - doc.size().height()) / 2
+        painter.translate(0, max(0, y))
+        doc.drawContents(painter)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        width = 0
+        widget = self.parent()
+        if widget is not None:
+            width = widget.viewport().width()
+        if not width:
+            width = opt.rect.width() or 400
+        doc = self._document(opt, index)
+        doc.setTextWidth(width)
+        return QSize(int(doc.idealWidth()), int(doc.size().height()) + 6)
 
 
 class SmoothScroller:
@@ -474,6 +534,18 @@ class FullAppWindow(QMainWindow):
 
         # --- Lyrics pane ---
         self.lyrics_list = QListWidget()
+        # Rich-text rows: the default delegate shows render_line_html()
+        # tags literally; LyricsItemDelegate paints the HTML instead.
+        self.lyrics_list.setItemDelegate(LyricsItemDelegate(self.lyrics_list))
+        # ScrollPerPixel is REQUIRED for the smooth scroll: the default
+        # ScrollPerItem measures the scrollbar in whole items, so the
+        # pixel target SmoothScroller computes was clamped to the item
+        # count and the list lurched between the extremes instead of
+        # gliding — the up/down scroll bug. With per-pixel scrolling
+        # the scrollbar value really is pixels and the target math holds.
+        self.lyrics_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.lyrics_list.setWordWrap(True)
+        self.lyrics_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.lyrics_list.setStyleSheet(
             f"background:{BG}; border:1px solid {PANEL}; border-radius:6px;")
         self.lyrics_list.itemClicked.connect(self._on_line_clicked)

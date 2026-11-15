@@ -24,16 +24,20 @@ import time as _time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import QEventLoop, QLockFile, QTimer  # noqa: E402
+from PySide6.QtCore import QEventLoop, QLockFile, Qt, QTimer  # noqa: E402
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QScrollBar, QWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView, QApplication, QLabel, QListWidget, QListWidgetItem,
+    QScrollBar, QWidget,
+)
 
 from lyrics import LyricLine, LyricWord, LyricsResult  # noqa: E402
 from playback import MonotonicPosition, PlaybackEngine  # noqa: E402
 from synced_lyrics import (  # noqa: E402
     DEFAULT_CONFIG,
     LabelFader,
+    LyricsItemDelegate,
     SmoothScroller,
     _lerp_color,
     build_display_menu,
@@ -295,12 +299,85 @@ def test_engine_position_monotonic(app):
     print("  engine position: OK (emitted position monotonic, line idx never flips back)")
 
 
+def test_lyrics_delegate_and_scroll(app):
+    """Regression: word HTML must RENDER, and scrolling must be per-pixel.
+
+    The Full App showed render_line_html() tags literally on William's
+    box ("<span style=...>Ooh,</span>") because QListWidget's default
+    delegate draws item text as plain text — LyricsItemDelegate paints
+    it with a QTextDocument instead. And the list lurched up/down
+    because the scrollbar was in the default ScrollPerItem mode (value
+    in whole items) while SmoothScroller computed pixel targets.
+    """
+    from PySide6.QtGui import QPainter, QPixmap
+    lst = QListWidget()
+    lst.resize(400, 300)
+    lst.setItemDelegate(LyricsItemDelegate(lst))
+    lst.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+    lst.setWordWrap(True)
+    assert lst.verticalScrollMode() == QAbstractItemView.ScrollPerPixel
+    line = LyricLine(0.0, "Look at the stars", [
+        LyricWord(0.0, 1.0, "Look"), LyricWord(1.0, 2.0, "at"),
+        LyricWord(2.0, 3.0, "the"), LyricWord(3.0, 4.0, "stars")])
+    lst.addItem(QListWidgetItem(render_line_html(line, 1)))
+    lst.addItem(QListWidgetItem("plain line here"))
+    lst.show()
+    _pump(app, 100)
+    delegate = lst.itemDelegate()
+    assert isinstance(delegate, LyricsItemDelegate)
+
+    def view_option():
+        # QListWidget has no public viewOptions() in PySide6; the
+        # delegate fills font/palette from the index itself.
+        from PySide6.QtWidgets import QStyleOptionViewItem
+        opt = QStyleOptionViewItem()
+        opt.initFrom(lst)
+        opt.rect = lst.viewport().rect()
+        opt.widget = lst
+        return opt
+
+    idx = lst.model().index(0, 0)
+    assert delegate.sizeHint(view_option(), idx).height() > 10
+    # Paint the HTML row into a pixmap: must not raise, and must draw
+    # something (a literal "<span..." string would also draw, so also
+    # assert the painted row is not one long unwrapped line: the
+    # delegate wraps at the viewport width, so a very long HTML line
+    # must be taller than a single text row).
+    pm = QPixmap(400, 300)
+    pm.fill(QColor("white"))
+    painter = QPainter(pm)
+    try:
+        delegate.paint(painter, view_option(), idx)
+    finally:
+        painter.end()
+    img = pm.toImage()
+    nonwhite = sum(
+        1 for y in range(0, 300, 4) for x in range(0, 400, 4)
+        if img.pixelColor(x, y) != QColor("white"))
+    assert nonwhite > 0, "delegate painted nothing"
+    long_line = LyricLine(0.0, "word " * 40, [
+        LyricWord(i, i + 1, "word") for i in range(40)])
+    long_item = QListWidgetItem(render_line_html(long_line, 5))
+    lst.addItem(long_item)
+    _pump(app, 100)
+    long_idx = lst.model().index(2, 0)
+    plain_idx = lst.model().index(1, 0)
+    assert (delegate.sizeHint(view_option(), long_idx).height()
+            > delegate.sizeHint(view_option(), plain_idx).height()), \
+        "long HTML line must wrap to multiple rows"
+    print("  lyrics delegate + scroll: OK (HTML paints, wraps, ScrollPerPixel)")
+
+
 def test_demo_word_highlight(app):
     """End to end (headless, --demo data): the Full App's current list
     item and the Overlay's current label carry word HTML, not plain
     text, once playback passes the first words of a line."""
     from synced_lyrics import AppController
     controller = AppController(app, demo=True, mode="full", screen_choice=None)
+    # The Full App must carry the fixes: HTML delegate + per-pixel scroll.
+    assert isinstance(controller.full.lyrics_list.itemDelegate(), LyricsItemDelegate)
+    assert (controller.full.lyrics_list.verticalScrollMode()
+            == QAbstractItemView.ScrollPerPixel)
     try:
         engine = controller.engine
         # Freeze demo playback: the 250 ms poll timer would otherwise
@@ -343,6 +420,7 @@ def main():
     test_single_instance_lock()
     test_local_server_raise(app)
     test_render_line_html()
+    test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()
     test_engine_position_monotonic(app)
     test_demo_word_highlight(app)
