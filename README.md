@@ -70,8 +70,14 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
 ```bash
 git clone https://github.com/konn-neko/synced-lyrics-linux.git
 cd synced-lyrics-linux
+chmod +x install.sh
 ./install.sh
 ```
+
+> GitHub's web upload doesn't preserve the executable bit, so a fresh
+> clone may report `./install.sh exists but is not an executable file`
+> (fish) / `Permission denied` (bash). The `chmod +x install.sh` line
+> above fixes that. `bash install.sh` also works without it.
 
 `install.sh` installs `python-pyside6` + `playerctl` via pacman (with
 sudo — run it yourself), then creates a `synced-lyrics` launcher in
@@ -190,6 +196,8 @@ Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Problem | Fix |
 |---|---|
 | "No MPRIS player found" | Start Spotify / YouTube Music and press play once. Check the player actually exposes MPRIS: `playerctl -l` should list it. |
+| `./install.sh` is not executable / Permission denied | Run `chmod +x install.sh` first, then `./install.sh` — or just `bash install.sh`. A fresh clone loses the executable bit. |
+| `synced-lyrics` command not found | `install.sh` never ran (see above) — it creates the `~/.local/bin/synced-lyrics` launcher. Run it, then open a new shell so `~/.local/bin` is on your `PATH`. |
 | Lyrics never load | Check network to `lrclib.net`, and try `--test-lyrics "Coldplay" "Yellow"` — if that works, the track just isn't in LRCLIB. |
 | Wrong lyrics for a track | LRCLIB matched by title/artist/duration. Use the manual search box (`Artist — Title`) to try a different spelling. |
 | Overlay won't come back | Right-click the tray icon → Show Full App, or `Ctrl+1` in the Full App. If click-through is on, click the `◉` handle. |
