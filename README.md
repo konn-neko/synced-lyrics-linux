@@ -30,9 +30,14 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   controls, manual search, and a scrollable lyrics pane. The current line
   is highlighted in crimson (`#FF1A47`), upcoming lines in obsidian blue
   (`#466EA5`), past lines dimmed. Click a line to seek to it.
+  Line changes are animated, not instant: the list glides to the new
+  line (~350ms smooth scroll) while the highlight colour crossfades
+  (~150ms). Turn it off in `View > Smooth line animations` (or
+  `"line_animations": false` in the config) for the old instant swap.
 - **Overlay mode** — frameless, always-on-top, translucent. Shows the
   current line large + the next line dimmed, with track title/artist and
-  play/pause controls. Draggable, resizable, double-click to return to
+  play/pause controls. Lines crossfade on change (~150ms out, ~250ms in)
+  instead of snapping. Draggable, resizable, double-click to return to
   the Full App. Right-click menu has opacity slider and click-through
   toggle (clicks pass through, except a small `◉` handle that turns
   click-through back off).
@@ -208,7 +213,9 @@ Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 `~/.config/synced-lyrics-linux/config.json` — sync offset, font size,
 display choice, minimise-to-tray, overlay opacity / click-through,
-last player. Edit it while the app is closed, or use the in-app controls.
+`line_animations` (smooth scroll + crossfades on line change, default
+`true`; set `false` for the instant old-style swap), last player. Edit
+it while the app is closed, or use the in-app controls.
 
 Lyrics cache: `~/.cache/synced-lyrics-linux/` (JSON, one file per track).
 Album art cache: `~/.cache/synced-lyrics-linux/art/`. Both are gitignored

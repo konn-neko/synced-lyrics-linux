@@ -90,6 +90,30 @@ no login, no API keys.
   headless tests missed it because the tray is unavailable offscreen.
   `build_display_menu()` now guards this, and `test_ui_smoke.py`
   (run offscreen) covers QApplication / QWidget / None parents.
+- Line-change animation (Qt-native, no new deps; see `SmoothScroller`,
+  `LabelFader`, `_lerp_color` in `synced_lyrics.py`):
+  Full App glides to the new line — `QPropertyAnimation` on the
+  vertical scrollbar's `value`, 350ms, `QEasingCurve.OutCubic` — while
+  the highlight colour crossfades over ~150ms (5 x 30ms `QTimer`
+  steps, `_lerp_color`, font/bold swap stays instant so row heights
+  are final before the scroll target is computed). Overlay crossfades
+  each label — `QGraphicsOpacityEffect` + one reused
+  `QPropertyAnimation` on `opacity`, 150ms out, swap text, 250ms in,
+  OutCubic; no geometry animation (labels stay layout-managed).
+  One animation object per window, reused. Rapid line changes:
+  the scroller stops and restarts from the current scroll value;
+  the fader updates its pending text mid-fade-out or restarts the
+  fade mid-fade-in; the Full App fade is finalised (`_finish_fade`)
+  before the next highlight. `_on_lyrics` stops all animations
+  BEFORE clearing the list (the fade holds items `clear()` deletes).
+  Toggle: config `"line_animations"` (default `true`), Full App
+  `View > Smooth line animations` + overlay right-click menu, via
+  `AppController.set_line_animations()`; both windows read the cfg
+  live at each line change. When off: instant `setValue` /
+  instant `setText` + final colours, exactly the old behaviour.
+  Tests: `test_ui_smoke.py` covers the helpers directly (glide,
+  mid-glide retarget, mid-fade retarget, instant-when-off) — the
+  windows themselves are only exercised by the `--demo` smoke run.
 - Overlay: frameless, `WindowStaysOnTopHint`, `Qt.Tool` (no taskbar
   entry), translucent dark background, `QSizeGrip`, drag by mouse,
   opacity via `setWindowOpacity`, click-through via
@@ -111,7 +135,7 @@ no login, no API keys.
 
 - Config: `~/.config/synced-lyrics-linux/config.json`
   (offset, font_size, display, minimise_to_tray, overlay_opacity,
-  overlay_click_through, last_player).
+  overlay_click_through, line_animations, last_player).
 - Lyrics cache: `~/.cache/synced-lyrics-linux/*.json`.
 - Album art cache: `~/.cache/synced-lyrics-linux/art/`.
 

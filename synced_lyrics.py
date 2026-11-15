@@ -23,13 +23,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QSizeGrip, QSlider, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget,
-    QWidgetAction,
+    QApplication, QComboBox, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout,
+    QLabel, QListWidget, QListWidgetItem, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QSizeGrip, QSlider, QStyle, QSystemTrayIcon,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 import mpris
@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "minimise_to_tray": True,
     "overlay_opacity": 0.85,
     "overlay_click_through": False,
+    "line_animations": True,  # smooth scroll + crossfade; False = instant swap
     "last_player": "",
 }
 
@@ -179,6 +180,141 @@ def build_display_menu(parent, app: QApplication, current_choice, on_pick):
     act.triggered.connect(lambda _c=False: on_pick("follow"))
     menu.addAction(act)
     return menu
+
+
+# ------------------------------------------------------- line-change animation
+# Line changes used to be instant: the highlight colour/font swapped and
+# scrollToItem jumped in one frame, and the overlay setText() swapped
+# with no transition at all. That reads as "snappy". These helpers make
+# the change glide instead. One animation object each, reused for the
+# life of the window; no polling, no extra threads.
+# Durations: Full App scroll 350ms, colour crossfade ~150ms,
+# Overlay fade-out 150ms + fade-in 250ms, all QEasingCurve.OutCubic.
+
+def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
+    """Linear interpolation between two QColors (t=0 -> c1, t=1 -> c2)."""
+    return QColor(
+        round(c1.red() + (c2.red() - c1.red()) * t),
+        round(c1.green() + (c2.green() - c1.green()) * t),
+        round(c1.blue() + (c2.blue() - c1.blue()) * t))
+
+
+class SmoothScroller:
+    """Animate a QScrollBar's value to a target instead of jumping.
+
+    Retargeting mid-animation is safe: stop() the running animation and
+    start a new one from the scrollbar's current value, so a fast run
+    of line changes never queues up or overshoots.
+    """
+
+    DURATION_MS = 350
+
+    def __init__(self, scrollbar):
+        self.bar = scrollbar
+        self.anim = QPropertyAnimation(scrollbar, b"value", scrollbar)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.setDuration(self.DURATION_MS)
+
+    def scroll_to(self, target, enabled=True):
+        target = max(self.bar.minimum(), min(self.bar.maximum(), int(target)))
+        if not enabled:
+            self.anim.stop()
+            self.bar.setValue(target)
+            return
+        if self.bar.value() == target:
+            return
+        self.anim.stop()
+        self.anim.setStartValue(self.bar.value())
+        self.anim.setEndValue(target)
+        self.anim.start()
+
+    def stop(self):
+        self.anim.stop()
+
+
+class LabelFader:
+    """Crossfade a QLabel's text: fade out, swap text, fade in.
+
+    One QGraphicsOpacityEffect + one QPropertyAnimation on its opacity,
+    reused. If show_text() is called mid-fade, the pending text is
+    updated (mid-fade-out) or the fade restarts (mid-fade-in), so the
+    label always lands on the newest text — never a stale line, never
+    two animations fighting. No geometry animation: the label stays
+    layout-managed, only its opacity moves.
+    """
+
+    FADE_OUT_MS = 150
+    FADE_IN_MS = 250
+
+    def __init__(self, label: QLabel):
+        self.label = label
+        self.effect = QGraphicsOpacityEffect(label)
+        self.effect.setOpacity(1.0)
+        label.setGraphicsEffect(self.effect)
+        self.anim = QPropertyAnimation(self.effect, b"opacity", label)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.finished.connect(self._on_finished)
+        self._state = "idle"  # idle | out | in
+        self._pending = None
+        self._ignore_finished = False
+
+    def show_text(self, text, enabled=True):
+        if not enabled:
+            self._cancel()
+            self.label.setText(text)
+            self.effect.setOpacity(1.0)
+            return
+        if text == self.label.text() and self._state == "idle":
+            if self.effect.opacity() < 1.0:
+                self.effect.setOpacity(1.0)
+            return
+        if self._state == "out":
+            # Already fading out: just swap what we land on.
+            self._pending = text
+            return
+        self._pending = text
+        self._start_fade_out()
+
+    def _start_fade_out(self):
+        self._state = "out"
+        self._ignore_finished = True  # stop() must not trigger _on_finished
+        self.anim.stop()
+        self._ignore_finished = False
+        self.anim.setDuration(self.FADE_OUT_MS)
+        self.anim.setStartValue(self.effect.opacity())
+        self.anim.setEndValue(0.0)
+        self.anim.start()
+
+    def _start_fade_in(self):
+        self._state = "in"
+        self._ignore_finished = True
+        self.anim.stop()
+        self._ignore_finished = False
+        self.anim.setDuration(self.FADE_IN_MS)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.start()
+
+    def _cancel(self):
+        self._ignore_finished = True
+        try:
+            self.anim.stop()
+        finally:
+            self._ignore_finished = False
+        self._state = "idle"
+        self._pending = None
+
+    def _on_finished(self):
+        if self._ignore_finished:
+            return
+        if self._state == "out":
+            if self._pending is not None:
+                self.label.setText(self._pending)
+                self._pending = None
+            self._start_fade_in()
+        elif self._state == "in":
+            self._state = "idle"
+            self.effect.setOpacity(1.0)
 
 
 # ------------------------------------------------------------- shared view
@@ -301,6 +437,18 @@ class FullAppWindow(QMainWindow):
         self.lyrics_list.itemClicked.connect(self._on_line_clicked)
         layout.addWidget(self.lyrics_list, stretch=1)
 
+        # Line-change animation state: one reused scroller for the glide
+        # to the current line, one QTimer stepping the highlight colour
+        # crossfade. _fade_prev/_fade_cur are the items being faded.
+        self._scroller = SmoothScroller(self.lyrics_list.verticalScrollBar())
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(30)
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+        self._fade_prev = None
+        self._fade_cur = None
+        self._fade_step = 0
+        self._fade_steps = 5  # 5 x 30ms = ~150ms colour crossfade
+
         self.statusBar().showMessage("Starting…")
         self._build_menu()
         self._apply_style()
@@ -355,6 +503,11 @@ class FullAppWindow(QMainWindow):
         a.triggered.connect(lambda: move_window_to_screen(
             self, QApplication.instance(), self.cfg.get("display", "primary")))
         view_menu.addAction(a)
+        self.anim_act = QAction("Smooth line animations", self, checkable=True)
+        self.anim_act.setChecked(bool(self.cfg.get("line_animations", True)))
+        self.anim_act.triggered.connect(
+            lambda checked: c.set_line_animations(checked))
+        view_menu.addAction(self.anim_act)
 
         help_menu = menubar.addMenu("&Help")
         a = QAction("About", self)
@@ -411,6 +564,13 @@ class FullAppWindow(QMainWindow):
             pass  # art is decorative; never break playback for it
 
     def _on_lyrics(self, lyrics):
+        # Stop any in-flight line animation BEFORE clearing: the fade
+        # holds QListWidgetItems that clear() would delete.
+        self._scroller.stop()
+        self._fade_timer.stop()
+        self._fade_prev = None
+        self._fade_cur = None
+        self._fade_step = 0
         self.lyrics_list.clear()
         self._current_idx = -2
         if lyrics is None:
@@ -451,23 +611,79 @@ class FullAppWindow(QMainWindow):
             self._highlight(idx)
 
     def _highlight(self, idx):
+        # Land any in-flight colour fade on its final colours first, so
+        # a fast run of line changes never leaves a stale colour behind.
+        self._finish_fade()
+        animated = bool(self.cfg.get("line_animations", True))
         prev = self._current_idx
+        prev_item = None
         if 0 <= prev < self.lyrics_list.count():
-            item = self.lyrics_list.item(prev)
-            item.setForeground(QColor(DIM))
+            prev_item = self.lyrics_list.item(prev)
             f = QFont(self.font())
             f.setPointSize(self.cfg["font_size"])
             f.setBold(False)
-            item.setFont(f)
+            prev_item.setFont(f)
         self._current_idx = idx
-        if 0 <= idx < self.lyrics_list.count():
-            item = self.lyrics_list.item(idx)
+        if not (0 <= idx < self.lyrics_list.count()):
+            if prev_item is not None:
+                prev_item.setForeground(QColor(DIM))
+            return
+        item = self.lyrics_list.item(idx)
+        f = QFont(self.font())
+        f.setPointSize(self.cfg["font_size"] + 2)
+        f.setBold(True)
+        item.setFont(f)
+        # Colours: instant final values when animations are off; when on,
+        # start from the old colours and let _on_fade_tick walk them to
+        # the final ones over ~150ms (prev crimson -> dim, cur dim -> crimson).
+        if animated:
+            if prev_item is not None:
+                prev_item.setForeground(QColor(CRIMSON))
+            item.setForeground(QColor(DIM))
+            self._fade_prev = prev_item
+            self._fade_cur = item
+            self._fade_step = 0
+            self._fade_timer.start()
+        else:
+            if prev_item is not None:
+                prev_item.setForeground(QColor(DIM))
             item.setForeground(QColor(CRIMSON))
-            f = QFont(self.font())
-            f.setPointSize(self.cfg["font_size"] + 2)
-            f.setBold(True)
-            item.setFont(f)
-            self.lyrics_list.scrollToItem(item, QListWidget.PositionAtCenter)
+        # Smooth-scroll: glide the new line to the centre (~350ms,
+        # OutCubic) instead of scrollToItem's instant jump. The target
+        # is computed from the item rect AFTER the font change, so row
+        # heights are final. Retargeting mid-glide restarts from the
+        # current scroll value (see SmoothScroller).
+        bar = self.lyrics_list.verticalScrollBar()
+        rect = self.lyrics_list.visualItemRect(item)
+        target = (rect.top() + bar.value() + rect.height() // 2
+                  - self.lyrics_list.viewport().height() // 2)
+        self._scroller.scroll_to(target, enabled=animated)
+
+    def _on_fade_tick(self):
+        self._fade_step += 1
+        t = min(1.0, self._fade_step / self._fade_steps)
+        if self._fade_cur is not None:
+            self._fade_cur.setForeground(
+                _lerp_color(QColor(DIM), QColor(CRIMSON), t))
+        if self._fade_prev is not None:
+            self._fade_prev.setForeground(
+                _lerp_color(QColor(CRIMSON), QColor(DIM), t))
+        if t >= 1.0:
+            self._fade_timer.stop()
+            self._fade_cur = None
+            self._fade_prev = None
+
+    def _finish_fade(self):
+        """Apply the final colours of any in-flight crossfade at once."""
+        if self._fade_timer.isActive():
+            self._fade_timer.stop()
+        if self._fade_cur is not None:
+            self._fade_cur.setForeground(QColor(CRIMSON))
+            self._fade_cur = None
+        if self._fade_prev is not None:
+            self._fade_prev.setForeground(QColor(DIM))
+            self._fade_prev = None
+        self._fade_step = 0
 
     def _on_slider_released(self):
         self._dragging_slider = False
@@ -591,6 +807,13 @@ class OverlayWindow(QWidget):
         self.next_label.setStyleSheet(f"color:{OBSIDIAN}; font-size:16px;")
         layout.addWidget(self.next_label)
 
+        # Line-change crossfade: one LabelFader per label, reused.
+        # show_text() fades the old line out (~150ms), swaps the text,
+        # fades the new line in (~250ms). No geometry animation — the
+        # labels stay layout-managed, only their opacity moves.
+        self._current_fader = LabelFader(self.current_label)
+        self._next_fader = LabelFader(self.next_label)
+
         grip = QSizeGrip(self)
         layout.addWidget(grip, alignment=Qt.AlignRight)
 
@@ -663,6 +886,10 @@ class OverlayWindow(QWidget):
         menu.addMenu(build_display_menu(
             self, QApplication.instance(), self.cfg.get("display", "primary"),
             c.pick_display))
+        anim = QAction("Smooth line animations", self, checkable=True)
+        anim.setChecked(bool(self.cfg.get("line_animations", True)))
+        anim.triggered.connect(lambda checked: c.set_line_animations(checked))
+        menu.addAction(anim)
         ct = QAction("Click-through (clicks pass through)", self, checkable=True)
         ct.setChecked(bool(self.cfg.get("overlay_click_through", False)))
         ct.triggered.connect(lambda checked: c.set_overlay_click_through(checked))
@@ -695,9 +922,11 @@ class OverlayWindow(QWidget):
 
     def _on_lyrics(self, lyrics):
         self._current_idx = -2
+        animated = bool(self.cfg.get("line_animations", True))
         if lyrics is None or not lyrics.has_synced:
-            self.current_label.setText("♪" if not lyrics else "No synced lyrics")
-            self.next_label.setText("")
+            self._current_fader.show_text(
+                "♪" if not lyrics else "No synced lyrics", enabled=animated)
+            self._next_fader.show_text("", enabled=animated)
             return
         self._on_position(0.0, -1)
 
@@ -710,13 +939,17 @@ class OverlayWindow(QWidget):
         if idx == self._current_idx:
             return
         self._current_idx = idx
+        animated = bool(self.cfg.get("line_animations", True))
         if idx < 0:
-            self.current_label.setText("♪")
-            self.next_label.setText(lyrics.synced_lines[0].text if lyrics.synced_lines else "")
+            self._current_fader.show_text("♪", enabled=animated)
+            self._next_fader.show_text(
+                lyrics.synced_lines[0].text if lyrics.synced_lines else "",
+                enabled=animated)
         else:
-            self.current_label.setText(lyrics.synced_lines[idx].text)
+            self._current_fader.show_text(
+                lyrics.synced_lines[idx].text, enabled=animated)
             nxt = lyrics.synced_lines[idx + 1].text if idx + 1 < len(lyrics.synced_lines) else ""
-            self.next_label.setText(nxt)
+            self._next_fader.show_text(nxt, enabled=animated)
 
 
 # ------------------------------------------------------------ app controller
@@ -848,6 +1081,20 @@ class AppController:
     def toggle_minimise_to_tray(self, checked: bool):
         self.cfg["minimise_to_tray"] = bool(checked)
         save_config(self.cfg)
+
+    def set_line_animations(self, enabled: bool):
+        """Persist the smooth-line-animations toggle.
+
+        Both windows read cfg["line_animations"] live at each line
+        change, so this just saves it and keeps the Full App View menu
+        checkmark in sync (the overlay context menu is rebuilt fresh
+        on every right-click, so it reads the value itself).
+        """
+        self.cfg["line_animations"] = bool(enabled)
+        save_config(self.cfg)
+        act = getattr(self.full, "anim_act", None)
+        if act is not None:
+            act.setChecked(bool(enabled))
 
     def quit_app(self):
         self.engine.stop()
