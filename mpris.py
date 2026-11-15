@@ -65,6 +65,21 @@ def _dbus_available() -> bool:
         return False
 
 
+def _is_error(reply) -> bool:
+    """True if a QDBus reply is an error.
+
+    In PySide6 the enum lives at QDBusMessage.MessageType.ErrorMessage —
+    `reply.ErrorMessage` does not exist and raises AttributeError, which
+    crashed play_pause/next/previous/seek on real desktops (headless
+    tests never reached a live D-Bus reply, so they missed it).
+    """
+    try:
+        from PySide6.QtDBus import QDBusMessage
+        return reply.type() == QDBusMessage.MessageType.ErrorMessage
+    except Exception:
+        return False
+
+
 def _dbus_get(service: str, interface: str, prop: str):
     from PySide6.QtDBus import QDBusConnection, QDBusInterface
     bus = QDBusConnection.sessionBus()
@@ -73,7 +88,7 @@ def _dbus_get(service: str, interface: str, prop: str):
     if not iface.isValid():
         return None
     reply = iface.call("Get", interface, prop)
-    if reply.type() == reply.ErrorMessage:
+    if _is_error(reply):
         return None
     args = reply.arguments()
     if not args:
@@ -88,7 +103,7 @@ def _dbus_call(service: str, interface: str, method: str, *args):
     if not iface.isValid():
         return False
     reply = iface.call(method, *args)
-    return reply.type() != reply.ErrorMessage
+    return not _is_error(reply)
 
 
 def list_players_dbus() -> list[str]:
@@ -100,7 +115,7 @@ def list_players_dbus() -> list[str]:
         iface = QDBusInterface("org.freedesktop.DBus", "/org/freedesktop/DBus",
                                "org.freedesktop.DBus", bus)
         reply = iface.call("ListNames")
-        if reply.type() == reply.ErrorMessage:
+        if _is_error(reply):
             return []
         names = _unwrap(reply.arguments()[0]) if reply.arguments() else []
         prefix = "org.mpris.MediaPlayer2."
@@ -249,6 +264,6 @@ def seek(player: str, seconds: float) -> bool:
                                "org.mpris.MediaPlayer2.Player", bus)
         reply = iface.call("SetPosition", QDBusObjectPath(str(track_id)),
                            int(seconds * 1_000_000))
-        return reply.type() != reply.ErrorMessage
+        return not _is_error(reply)
     except Exception:
         return False
