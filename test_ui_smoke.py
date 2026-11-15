@@ -492,12 +492,14 @@ def test_choose_lyrics_dialog(app):
     from lyrics import LyricsResult
     from synced_lyrics import ChooseLyricsDialog
 
-    def _candidate(source, track, album, word):
+    def _candidate(source, track, album, word, censored=False):
         line = LyricLine(5.0, "Look at the stars",
                          words=[LyricWord(5.0, 6.0, "Look")] if word else [])
         return LyricsResult(
             artist="Coldplay", track=track, album=album, duration=269.0,
             synced_lines=[line], source=source, lrclib_id=7 if source == "search" else None,
+            raw_text=("[00:05.00] f**k the stars" if censored
+                      else "[00:05.00] Look at the stars"),
             raw_record={"id": 7, "artistName": "Coldplay",
                         "trackName": track, "albumName": album,
                         "duration": 269.0,
@@ -505,7 +507,7 @@ def test_choose_lyrics_dialog(app):
                         "plainLyrics": "Look at the stars"} if source == "search" else None)
 
     canned = [_candidate("betterlyrics", "Yellow", "Parachutes", True),
-              _candidate("qq", "Yellow", "Parachutes", True),
+              _candidate("qq", "Yellow", "Parachutes", True, censored=True),
               _candidate("search", "Yellow", "Parachutes", False),
               _candidate("search", "Yellow", "Live 2003", False)]
     orig_search = playback.search_all_candidates
@@ -527,6 +529,8 @@ def test_choose_lyrics_dialog(app):
             assert "Better Lyrics" in dlg.list_widget.item(0).text()
             assert "QQ Music" in dlg.list_widget.item(1).text()
             assert "word-synced" in dlg.list_widget.item(0).text()
+            assert "censored" not in dlg.list_widget.item(0).text()
+            assert "censored" in dlg.list_widget.item(1).text()
             dlg.list_widget.setCurrentRow(1)
             dlg._use_selected()
             assert engine.lyrics is canned[1], "pick did not apply to the engine"

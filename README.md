@@ -52,10 +52,12 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   Choose lyrics…` (also in the Overlay menu and the tray menu) lists
   every match from all four providers — Better Lyrics (syllable-sync),
   QQ Music (word-sync), LRCLIB and Kugou — word-synced first, each
-  labelled with its provider, and the pick applies immediately and
-  sticks for that track. `Lyrics > Re-fetch lyrics (ignore cache)`
-  drops the cached lyrics and pulls fresh, for when the cache has
-  the wrong version.
+  labelled with its provider, and rows whose lyrics are
+  asterisk-censored (`f**k`, `ni**a` …) carry a "censored" tag and
+  sort below uncensored matches at the same sync level. The pick
+  applies immediately and sticks for that track. `Lyrics > Re-fetch
+  lyrics (ignore cache)` drops the cached lyrics and pulls fresh,
+  for when the cache has the wrong version.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay
   right-click menu) shows the raw lyrics file exactly as received
   plus every URL query the app made this run with its response, so

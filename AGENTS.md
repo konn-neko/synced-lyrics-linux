@@ -262,6 +262,21 @@ no login, no API keys.
   spaces and merges every line into one. Musixmatch (needs an API
   key) and Apple Music (needs a developer token) are NOT viable
   under the no-keys rule, so they are not wired in.
+- Explicit / censored lyrics: there is NO explicit filter on any
+  provider — the censoring is baked into the data. Better Lyrics
+  TTML is uncensored (Kendrick — HUMBLE. returns fuck/shit/bitch
+  intact); QQ and Kugou are always asterisked (`f**k`, `ni**a`,
+  `p**sy` — same censored upstream); LRCLIB varies by record. The
+  picker labels it instead: `LyricsResult.is_censored` (via
+  `is_censored_text(raw_text)` — a token with `*` next to letters,
+  or a bare `****`; a lone `*` does not count) is shown as a
+  "censored" tag in `_candidate_label`, and `search_all_candidates`
+  sorts uncensored above censored at the same sync level
+  (rank = sync, censored, provider). Auto-fetch already prefers
+  TTML, so the explicit version wins automatically when it exists.
+  Workaround when TTML has no cached copy: play the track once in
+  the Better Lyrics browser extension — it caches the uncensored
+  TTML, and the app picks it up from then on.
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
   + LRCLIB + QQ + Kugou, via `log_request(url, status, body)` in
   `_get_json`, `fetch_betterlyrics` and `_fetch_betterlyrics_provider`;
@@ -311,7 +326,12 @@ no login, no API keys.
 ```bash
 python3 -m py_compile synced_lyrics.py koneko_lyrics.py lyrics.py mpris.py playback.py test_lyrics.py test_ui_smoke.py
 python3 test_lyrics.py            # LRC/TTML parse + live Better Lyrics + live LRCLIB (live tests SKIP when offline or uncached, never fail for no network)
-QT_QPA_PLATFORM=offscreen /tmp/lyrics-venv/bin/python test_ui_smoke.py   # animation helpers, render_line_html, MonotonicPosition, single-instance lock + local server, demo word highlight
+QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # animation helpers, render_line_html, MonotonicPosition, single-instance lock + local server, demo word highlight
+  (Test venv lives at `~/.local/lyrics-venv` — NOT /tmp: /tmp is a
+  512M tmpfs and a fresh PySide6 install does not fit, and /tmp is
+  wiped on VM replacement. The venv also needs system libEGL —
+  installed 2026-11-14 from the libegl1 + libegl-mesa0 .debs after
+  `apt-get update` hung on a mirror.)
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo

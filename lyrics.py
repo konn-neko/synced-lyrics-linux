@@ -107,6 +107,29 @@ class LyricLine:
     words: list[LyricWord] = field(default_factory=list)
 
 
+def is_censored_text(text: str) -> bool:
+    """True when lyric text carries asterisk-censored words.
+
+    Providers that censor explicit lyrics write them as `f**k`,
+    `Sh*t`, `b**ch`, `ni**a` or a bare `****` — a token containing
+    `*` next to letters, or a token of two or more asterisks. A lone
+    `*` (e.g. a multiplication sign) does not count. A track that
+    legitimately uses `***` as a separator would false-positive;
+    that is rare, and the only cost is a "censored" tag and a lower
+    sort rank in the picker.
+    """
+    for token in re.split(r"\s+", text or ""):
+        if not token:
+            continue
+        if "*" not in token:
+            continue
+        if len(token) >= 2 and token.strip("*") == "":
+            return True  # bare "****" standing in for a word
+        if any(c.isalnum() for c in token):
+            return True  # "f**k", "Sh*t", "b**ch" ...
+    return False
+
+
 @dataclass
 class LyricsResult:
     artist: str
@@ -138,6 +161,14 @@ class LyricsResult:
     def has_word_sync(self) -> bool:
         """True when at least one line carries per-word timings."""
         return any(line.words for line in self.synced_lines)
+
+    @property
+    def is_censored(self) -> bool:
+        """True when the raw lyrics text carries asterisk-censored
+        words (see `is_censored_text`). Checked against `raw_text`,
+        which every provider sets — so it works for TTML, QRC, LRC
+        and LRCLIB records alike."""
+        return is_censored_text(self.raw_text or "")
 
     def line_at(self, position: float, offset: float = 0.0) -> int:
         """Index of the line active at `position` (offset applied, seconds).
@@ -703,7 +734,11 @@ def search_all_candidates(
 
     def _rank(r: LyricsResult):
         sync = 0 if r.has_word_sync else (1 if r.has_synced else 2)
-        return (sync, _provider_rank(r))
+        # Uncensored above censored at the same sync level: a
+        # word-synced but asterisked QQ match ranks below an
+        # uncensored word-synced TTML match, and below nothing else.
+        censored = 1 if r.is_censored else 0
+        return (sync, censored, _provider_rank(r))
 
     candidates.sort(key=_rank)
     return candidates

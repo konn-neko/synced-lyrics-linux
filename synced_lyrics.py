@@ -871,7 +871,8 @@ def _candidate_label(result) -> str:
         provider = "LRCLIB"
     dur = fmt_time(result.duration) if result.duration else "??:??"
     album = f"  •  {result.album}" if result.album else ""
-    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}  •  {provider}"
+    censored = "  •  censored" if result.is_censored else ""
+    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}{censored}  •  {provider}"
             + (f"  •  LRCLIB #{result.lrclib_id}" if result.lrclib_id else ""))
 
 

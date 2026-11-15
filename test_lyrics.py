@@ -29,6 +29,7 @@ from lyrics import (  # noqa: E402
     fetch_kugou,
     fetch_lrclib,
     fetch_qq,
+    is_censored_text,
     log_request,
     parse_lrc,
     parse_qrc,
@@ -383,6 +384,66 @@ def test_search_all_candidates_merges():
     print("  search_all_candidates: OK (TTML, QQ, LRCLIB word, LRCLIB line)")
 
 
+def test_is_censored_detection():
+    """Asterisk-censored words are detected; plain text is not."""
+    assert is_censored_text("[00:05.00] f**k you")
+    assert is_censored_text("Sh*t happens")
+    assert is_censored_text("ni**a please")
+    assert is_censored_text("b**ch")
+    assert is_censored_text("what the **** is this")
+    assert is_censored_text('<span begin="0:05.000">f**k</span>')
+    assert not is_censored_text("fuck you")
+    assert not is_censored_text("Look at the stars")
+    assert not is_censored_text("la la la")
+    assert not is_censored_text("")
+    assert not is_censored_text("2 * 2 = 4")  # lone star, no letters
+    # LyricsResult exposes it via raw_text, whatever the provider.
+    r = LyricsResult(artist="A", track="T",
+                     synced_lines=[LyricLine(5.0, "f**k you")],
+                     raw_text="[00:05.00] f**k you", source="qq")
+    assert r.is_censored
+    r2 = LyricsResult(artist="A", track="T",
+                      synced_lines=[LyricLine(5.0, "fuck you")],
+                      raw_text="<tt>fuck you</tt>", source="betterlyrics")
+    assert not r2.is_censored
+    print("  is_censored detection: OK")
+
+
+def test_search_all_candidates_censored_sort():
+    """Uncensored above censored at the same sync level: TTML (clean)
+    first, then QQ (asterisked, still word-synced), then uncensored
+    LRCLIB lines, then censored LRCLIB, then Kugou (asterisked)."""
+    def _res(source, word, censored, track="Yellow"):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
+        raw = ("[00:05.00] f**k the stars" if censored
+               else "[00:05.00] Look at the stars")
+        return LyricsResult(artist="Coldplay", track=track, album="Parachutes",
+                            duration=269.0, synced_lines=[line],
+                            source=source, raw_text=raw)
+
+    orig = {name: getattr(_lyrics_module, name) for name in
+            ("fetch_betterlyrics", "fetch_qq", "fetch_kugou", "search_lrclib")}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", True, False)
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", True, True)
+        _lyrics_module.fetch_kugou = lambda *a, **k: _res("kugou", False, True)
+        _lyrics_module.search_lrclib = lambda *a, **k: [
+            _res("search", False, True, "Yellow (clean)"),
+            _res("search", False, False, "Yellow (explicit)")]
+        results = search_all_candidates("Coldplay", "Yellow", "Parachutes", 269.0)
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    got = [(r.source, r.track, r.is_censored) for r in results]
+    assert got == [("betterlyrics", "Yellow", False),
+                   ("qq", "Yellow", True),
+                   ("search", "Yellow (explicit)", False),
+                   ("search", "Yellow (clean)", True),
+                   ("kugou", "Yellow", True)], got
+    print("  censored sort: OK (clean word-sync, asterisked word-sync, clean line, asterisked line)")
+
+
 def test_live_qq_fetch():
     """Live check: Coldplay — Yellow via QQ returns word-synced QRC.
     Skipped when offline or when QQ has no match."""
@@ -480,6 +541,8 @@ TESTS = [
     test_parse_qrc_word_timings,
     test_parse_qrc_xml_wrapper,
     test_qq_cache_roundtrip,
+    test_is_censored_detection,
+    test_search_all_candidates_censored_sort,
     test_search_all_candidates_merges,
     test_live_qq_fetch,
     test_live_kugou_fetch,
