@@ -1,0 +1,219 @@
+# synced-lyrics-linux
+
+**Native Linux synced lyrics — a BetterLyrics-style app for Linux.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Qt6 / PySide6](https://img.shields.io/badge/Qt-6%20%2F%20PySide6-green.svg)](https://doc.qt.io/qtforpython/)
+
+> **Repo:** https://github.com/konn-neko/synced-lyrics-linux
+
+BetterLyrics is Windows-only (WinUI 3, Windows Media Transport Controls).
+On Linux the same job is actually easier: every player already publishes
+what's playing over **MPRIS**, and **LRCLIB** serves time-synced lyrics
+for free with no key and no login. This app glues those two together in a
+native Qt6 window — no Electron, no account, no API key.
+
+## Screenshots
+
+<!-- Placeholder — replace with real screenshots after the first run on CachyOS. -->
+<!-- ![Full App](docs/screenshots/full-app.png) -->
+<!-- ![Overlay](docs/screenshots/overlay.png) -->
+
+_Screenshots wanted: Full App window mid-song, and the Overlay floating
+over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
+
+## Features
+
+- **Full App window** — Now Playing bar with album art, progress slider,
+  Play/Pause / Prev / Next, player selector, sync-offset and font-size
+  controls, manual search, and a scrollable lyrics pane. The current line
+  is highlighted in crimson (`#FF1A47`), upcoming lines in obsidian blue
+  (`#466EA5`), past lines dimmed. Click a line to seek to it.
+- **Overlay mode** — frameless, always-on-top, translucent. Shows the
+  current line large + the next line dimmed, with track title/artist and
+  play/pause controls. Draggable, resizable, double-click to return to
+  the Full App. Right-click menu has opacity slider and click-through
+  toggle (clicks pass through, except a small `◉` handle that turns
+  click-through back off).
+- **Swap freely** — Full App has a "Pop out overlay" button; View menu
+  and shortcuts switch modes: `Ctrl+1` Full App, `Ctrl+2` Overlay.
+  Both windows share one `PlaybackEngine` — one MPRIS poller, one lyrics
+  fetcher — so switching modes never loses sync or restarts playback.
+- **System tray** — a `♪` tray icon (drawn in code, no asset needed)
+  while the app runs. Menu: Show Full App / Show Overlay, Play/Pause,
+  Next, Previous, Display picker, Quit. Double-click toggles the Full
+  App. Tooltip shows `Artist — Title` + the current lyric line.
+  Closing the Full App minimises to tray instead of quitting (toggle in
+  File menu / tray menu; Quit in the tray or File menu actually exits).
+  This is a tray icon, not a KDE panel plasmoid.
+- **Per-display** — `View > Display` (Full App) and the right-click /
+  tray menus list every display, e.g. `Display 1 — 1920x1080 (primary)`,
+  plus `Primary display` and `Follow mouse`. The choice is saved in
+  `~/.config/synced-lyrics-linux/config.json`. The Overlay moves to the
+  chosen display immediately; the Full App moves via
+  `View > Move Full App to selected display`. A saved display that has
+  disappeared falls back to primary.
+- **Any MPRIS player** — Spotify desktop, YouTube Music in Firefox /
+  Chromium, VLC, Elisa… discovered automatically, no player names
+  hardcoded. Player selector dropdown when several are playing.
+- **Synced lyrics from LRCLIB** — free, no key. Line-level sync, with
+  plain-lyrics and instrumental fallbacks, and a disk cache in
+  `~/.cache/synced-lyrics-linux/`.
+- **Demo mode** — `--demo` plays a fake Coldplay — Yellow with sample
+  lyrics, so you can try the UI with no player running.
+
+## Install
+
+### CachyOS / Arch Linux (one-command path)
+
+```bash
+git clone https://github.com/konn-neko/synced-lyrics-linux.git
+cd synced-lyrics-linux
+./install.sh
+```
+
+`install.sh` installs `python-pyside6` + `playerctl` via pacman (with
+sudo — run it yourself), then creates a `synced-lyrics` launcher in
+`~/.local/bin/` and a `synced-lyrics-linux.desktop` file so the app
+appears in the KDE application launcher.
+
+### Ubuntu / Debian
+
+```bash
+git clone https://github.com/konn-neko/synced-lyrics-linux.git
+cd synced-lyrics-linux
+sudo apt-get install python3-pyside6 playerctl
+python3 synced_lyrics.py
+```
+
+### Fedora
+
+```bash
+git clone https://github.com/konn-neko/synced-lyrics-linux.git
+cd synced-lyrics-linux
+sudo dnf install python3-pyside6 playerctl
+python3 synced_lyrics.py
+```
+
+### Generic (pip venv, any distro)
+
+```bash
+git clone https://github.com/konn-neko/synced-lyrics-linux.git
+cd synced-lyrics-linux
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python synced_lyrics.py
+```
+
+Requires Python 3.10+ and Qt6 (via PySide6). `playerctl` is optional —
+it's the fallback if QtDBus can't reach a player.
+
+## Run
+
+```bash
+synced-lyrics                 # Full App (after install.sh)
+synced-lyrics --mode overlay  # start straight in Overlay mode
+synced-lyrics --demo          # try the UI with no player running
+```
+
+Or without installing: `python3 synced_lyrics.py` from the repo folder.
+Play something in Spotify or YouTube Music and the lyrics follow.
+If several players are running, pick one in the Player dropdown.
+
+## CLI flags
+
+| Flag | What it does |
+|---|---|
+| `--mode full \| overlay` | Start in Full App (default) or Overlay mode |
+| `--screen N` | Launch on display N (0-based; see View > Display) |
+| `--demo` | Demo mode: fake Coldplay — Yellow, sample lyrics, no player needed |
+| `--test-lyrics "Artist" "Title"` | Fetch lyrics from LRCLIB and print the LRC, then exit |
+| `--help` | Show all flags |
+
+Examples:
+
+```bash
+synced-lyrics --mode overlay --screen 1
+synced-lyrics --test-lyrics "Coldplay" "Yellow"
+```
+
+## How it works
+
+```
+Spotify / YouTube Music / VLC
+        │  MPRIS over D-Bus (title, artist, album, duration, position)
+        ▼
+PlaybackEngine  (one poller, 250 ms, position interpolated
+        │       with a monotonic clock between polls)
+        ├─► LRCLIB  GET /api/get?artist_name=&track_name=&album_name=&duration=
+        │           (fallback /api/search; cached in ~/.cache/synced-lyrics-linux/)
+        ▼
+Full App window  ⇄  Overlay window  ⇄  System tray
+        (all three render the same engine state)
+```
+
+- **MPRIS:** the standard Linux media-player interface. Primary path is
+  `PySide6.QtDBus`; if that fails, `playerctl` is used. Browsers report
+  position in 1-second steps, so the engine interpolates between polls.
+- **LRCLIB:** `https://lrclib.net/api/get` returns `syncedLyrics` (LRC),
+  `plainLyrics`, `instrumental`, `duration`. No key; the client sends
+  `Lrclib-Client: synced-lyrics-linux/1.0`. Rate limits (~45 req/min
+  generic, ~90/min identified) are honoured — a 429 shows
+  "rate limited — retry in Ns" instead of hammering the API.
+- **LRC parsing:** `[mm:ss.xx]` / `[mm:ss]`, multiple timestamps per
+  line, `[offset:]`, enhanced `<mm:ss.xx>` word tags (stripped to line
+  text). See [AGENTS.md](AGENTS.md) for the full rules.
+
+Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Limitations
+
+- **Lyrics coverage depends on LRCLIB.** Not every track has synced
+  lyrics; some have plain lyrics only, some have none. The app says so
+  plainly ("No synced lyrics for this track") instead of guessing.
+- **Line sync only.** LRCLIB is mostly line-timed; word-by-word karaoke
+  needs enhanced timings that most tracks don't have.
+- **Sync can be off by a second or two** on some tracks — use the
+  Sync `−0.5s` / `+0.5s` buttons; the offset is saved.
+- **Browsers report position in 1 s steps** — the app interpolates, so
+  the highlight still moves smoothly, but a seek in the browser can
+  take up to a poll (~250 ms) to show up.
+- **Overlay click-through** needs the tray menu or the `◉` handle to
+  turn back off (the overlay itself ignores clicks in that mode).
+- **Wayland:** window placement is the compositor's call; the Display
+  picker moves the window to the chosen screen's geometry, but a
+  compositor may still override always-on-top behaviour.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| "No MPRIS player found" | Start Spotify / YouTube Music and press play once. Check the player actually exposes MPRIS: `playerctl -l` should list it. |
+| Lyrics never load | Check network to `lrclib.net`, and try `--test-lyrics "Coldplay" "Yellow"` — if that works, the track just isn't in LRCLIB. |
+| Wrong lyrics for a track | LRCLIB matched by title/artist/duration. Use the manual search box (`Artist — Title`) to try a different spelling. |
+| Overlay won't come back | Right-click the tray icon → Show Full App, or `Ctrl+1` in the Full App. If click-through is on, click the `◉` handle. |
+| App doesn't start | `python3 synced_lyrics.py --demo` — if that works, the problem is MPRIS/player detection, not the app. Run `python3 -m py_compile synced_lyrics.py lyrics.py mpris.py playback.py` to check for syntax errors. |
+| Tray icon missing | Some Wayland sessions hide tray icons; the app still works from the Full App window. This is a tray icon, not a plasmoid — see `docs/ARCHITECTURE.md`. |
+
+## Configuration
+
+`~/.config/synced-lyrics-linux/config.json` — sync offset, font size,
+display choice, minimise-to-tray, overlay opacity / click-through,
+last player. Edit it while the app is closed, or use the in-app controls.
+
+Lyrics cache: `~/.cache/synced-lyrics-linux/` (JSON, one file per track).
+Album art cache: `~/.cache/synced-lyrics-linux/art/`. Both are gitignored
+and never committed.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: run the tests,
+keep the MPRIS + LRCLIB engine shared between modes, don't add logins
+or API keys.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright William / konn-neko, 2026.
+Lyrics themselves are fetched at runtime from LRCLIB and are not
+shipped with this repo.

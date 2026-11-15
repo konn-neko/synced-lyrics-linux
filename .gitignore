@@ -1,0 +1,21 @@
+# synced-lyrics-linux — never commit caches, lyrics, or local envs
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+*.log
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Lyrics cache + album art (fetched at runtime from LRCLIB, may contain
+# copyrighted lyric text — never commit it). The cache lives in
+# ~/.cache/synced-lyrics-linux/ anyway; this also covers any local copy.
+.cache/
+lyrics-cache/
+*.lrc
+
+# Local config (user's display / offset choices)
+config.json

@@ -1,0 +1,3 @@
+# synced-lyrics-linux — only runtime dependency is PySide6 (Qt6).
+# Prefer your distro package (see README / install.sh); pip is the fallback.
+PySide6>=6.6
