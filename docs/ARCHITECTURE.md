@@ -30,9 +30,11 @@ Repo: https://github.com/konn-neko/synced-lyrics-linux
 ┌──────────────┐      ┌──────────────────────────────┐
 │  mpris.py    │      │  Lyrics providers (no keys): │
 │  QtDBus 1st, │      │  Better Lyrics TTML (word),  │
-│  playerctl   │      │  QQ QRC (word), LRCLIB,      │
-│  fallback    │      │  Kugou — in that order;      │
-│              │      │  cache in ~/.cache/…         │
+│  playerctl   │      │  Unison, AMLL TTML (word),   │
+│  fallback    │      │  QQ QRC (word), NetEase yrc  │
+│              │      │  (word), LRCLIB, Kugou —     │
+│              │      │  in that order; cache in     │
+│              │      │  ~/.cache/…                  │
 └──────────────┘      └──────────────────────────────┘
        │
        ▼
@@ -130,7 +132,8 @@ See [AGENTS.md](../AGENTS.md) for the file map. In short:
 - `synced_lyrics.py` — UI + controller + CLI.
 - `playback.py` — shared engine (the only poller / fetcher).
 - `mpris.py` — player discovery, state, controls.
-- `lyrics.py` — LRC + TTML + QRC parsing, four-provider clients
-  (Better Lyrics TTML, QQ, LRCLIB, Kugou) + cache, demo fixture.
+- `lyrics.py` — LRC + TTML + QRC + yrc parsing, seven-provider
+  clients (Better Lyrics TTML, Unison, AMLL, QQ, NetEase, LRCLIB,
+  Kugou) + cache, demo fixture.
 - Config: `~/.config/synced-lyrics-linux/config.json`.
 - Cache: `~/.cache/synced-lyrics-linux/` (lyrics JSON + `art/`).

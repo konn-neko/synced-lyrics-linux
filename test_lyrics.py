@@ -25,10 +25,13 @@ from lyrics import (  # noqa: E402
     _REQUEST_LOG,
     cache_lrclib_record,
     clear_track_cache,
+    fetch_amll,
     fetch_betterlyrics,
     fetch_kugou,
     fetch_lrclib,
+    fetch_netease,
     fetch_qq,
+    fetch_unison,
     is_censored_text,
     log_request,
     parse_lrc,
@@ -365,10 +368,14 @@ def test_search_all_candidates_merges():
                             source=source)
 
     orig = {name: getattr(_lyrics_module, name) for name in
-            ("fetch_betterlyrics", "fetch_qq", "fetch_kugou", "search_lrclib")}
+            ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_kugou", "search_lrclib")}
     try:
         _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", word=True)
+        _lyrics_module.fetch_unison = lambda *a, **k: _res("unison", word=True)
+        _lyrics_module.fetch_amll = lambda *a, **k: _res("amll", word=True)
         _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", word=True)
+        _lyrics_module.fetch_netease = lambda *a, **k: _res("netease", word=False)
         _lyrics_module.fetch_kugou = lambda *a, **k: None  # no match: adds nothing
         _lyrics_module.search_lrclib = lambda *a, **k: [
             _res("search", word=True, track="Yellow (live)"),
@@ -378,10 +385,11 @@ def test_search_all_candidates_merges():
         for name, fn in orig.items():
             setattr(_lyrics_module, name, fn)
     assert [r.source for r in results] == [
-        "betterlyrics", "qq", "search", "search"], [r.source for r in results]
-    assert results[0].has_word_sync and results[1].has_word_sync
-    assert results[2].has_word_sync and not results[3].has_word_sync
-    print("  search_all_candidates: OK (TTML, QQ, LRCLIB word, LRCLIB line)")
+        "betterlyrics", "unison", "amll", "qq", "search", "netease",
+        "search"], [r.source for r in results]
+    assert all(r.has_word_sync for r in results[:5])
+    assert not results[5].has_word_sync and not results[6].has_word_sync
+    print("  search_all_candidates: OK (TTML, Unison, AMLL, QQ, LRCLIB word, NetEase, LRCLIB line)")
 
 
 def test_is_censored_detection():
@@ -423,10 +431,14 @@ def test_search_all_candidates_censored_sort():
                             source=source, raw_text=raw)
 
     orig = {name: getattr(_lyrics_module, name) for name in
-            ("fetch_betterlyrics", "fetch_qq", "fetch_kugou", "search_lrclib")}
+            ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_kugou", "search_lrclib")}
     try:
         _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", True, False)
+        _lyrics_module.fetch_unison = lambda *a, **k: None
+        _lyrics_module.fetch_amll = lambda *a, **k: None
         _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", True, True)
+        _lyrics_module.fetch_netease = lambda *a, **k: None
         _lyrics_module.fetch_kugou = lambda *a, **k: _res("kugou", False, True)
         _lyrics_module.search_lrclib = lambda *a, **k: [
             _res("search", False, True, "Yellow (clean)"),
@@ -442,6 +454,162 @@ def test_search_all_candidates_censored_sort():
                    ("search", "Yellow (clean)", True),
                    ("kugou", "Yellow", True)], got
     print("  censored sort: OK (clean word-sync, asterisked word-sync, clean line, asterisked line)")
+
+
+def test_parse_ttml_amll_namespace():
+    """AMLL TTML resets the default namespace inside <div>
+    (xmlns=""), so its <p>/<span> elements are in NO namespace.
+    parse_ttml must match by local name or it finds zero lines."""
+    ttml = ('<tt xmlns="http://www.w3.org/ns/ttml" '
+            'xmlns:ttm="http://www.w3.org/ns/ttml#metadata">'
+            '<body dur="00:00:10.000"><div xmlns="" begin="00:00:00.686" end="00:00:10.000">'
+            '<p begin="00:00:00.686" end="00:00:03.110">'
+            '<span begin="00:00:00.686" end="00:00:01.020">Couldn\'t</span>'
+            '<span begin="00:00:01.020" end="00:00:01.193"> beat</span>'
+            '<span begin="00:00:01.193" end="00:00:01.361"> her</span>'
+            '<span ttm:role="x-translation" xml:lang="zh-CN">她露出笑容</span>'
+            '</p></div></body></tt>')
+    lines = parse_ttml(ttml)
+    assert len(lines) == 1, f"expected 1 line, got {len(lines)}"
+    assert lines[0].text == "Couldn't beat her"
+    assert lines[0].words[0].text == "Couldn't" and lines[0].words[1].text == "beat"
+    assert lines[0].words[2].text == "her"
+    print("  parse AMLL TTML (xmlns=\"\" div): OK (translation span ignored)")
+
+
+def test_parse_yrc_word_timings():
+    """NetEase yrc is the same shape as QRC ([startMs,durMs] lines,
+    word(startMs,durMs) segments) and parses with parse_qrc."""
+    yrc = ("[0,8390]Yellow(0,2961) (2961,493)-(3454,494) (3948,493)Coldplay(4441,3949)\n"
+           "[33580,2120]Look (33580,290)at (33870,290)the (34160,290)stars(34450,1250)\n")
+    lines = parse_qrc(yrc)
+    assert len(lines) == 2
+    assert lines[0].text == "Yellow - Coldplay"
+    assert lines[1].text == "Look at the stars"
+    assert lines[1].words[3].text == "stars" and lines[1].words[3].time == 34.45
+    print("  parse yrc: OK (QRC-shaped, word timings)")
+
+
+def test_unison_cache_roundtrip():
+    """A cached Unison TTML result reloads with word timings."""
+    ttml = ('<tt xmlns="http://www.w3.org/ns/ttml"><body><div>'
+            '<p begin="00:00:05.000" end="00:00:08.000">'
+            '<span begin="00:00:05.000" end="00:00:06.000">Look </span>'
+            '<span begin="00:00:06.000" end="00:00:08.000">stars</span>'
+            '</p></div></body></tt>')
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        from lyrics import _cache_path, _unison_cache_key
+        p = _cache_path(cache, _unison_cache_key("Coldplay", "Yellow", "Parachutes", 269.0))
+        p.write_text(json.dumps({"raw": ttml, "format": "ttml", "fetched_at": 0.0}),
+                     encoding="utf-8")
+        result = fetch_unison("Coldplay", "Yellow", "Parachutes", 269.0,
+                              cache_dir=cache)
+        assert result is not None and result.source == "unison-cache"
+        assert result.has_word_sync
+        assert result.synced_lines[0].text == "Look stars"
+    print("  unison cache round-trip: OK")
+
+
+def test_amll_cache_roundtrip():
+    """A cached AMLL TTML result reloads with word timings."""
+    ttml = ('<tt xmlns="http://www.w3.org/ns/ttml"><body><div>'
+            '<p begin="00:00:05.000" end="00:00:08.000">'
+            '<span begin="00:00:05.000" end="00:00:06.000">Look </span>'
+            '<span begin="00:00:06.000" end="00:00:08.000">stars</span>'
+            '</p></div></body></tt>')
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        from lyrics import _amll_cache_key, _cache_path
+        p = _cache_path(cache, _amll_cache_key("YOASOBI", "Idol", "Idol", 196.0))
+        p.write_text(json.dumps({"ttml": ttml, "amll_id": 1, "fetched_at": 0.0}),
+                     encoding="utf-8")
+        result = fetch_amll("YOASOBI", "Idol", "Idol", 196.0, cache_dir=cache)
+        assert result is not None and result.source == "amll-cache"
+        assert result.has_word_sync
+    print("  amll cache round-trip: OK")
+
+
+def test_netease_cache_roundtrip():
+    """A cached NetEase yrc result reloads with word timings; when
+    yrc is empty the cached LRC is used instead."""
+    yrc = ("[0,8390]Yellow(0,2961) (2961,493)-(3454,494) (3948,493)Coldplay(4441,3949)\n"
+           "[33580,2120]Look (33580,290)at (33870,290)the (34160,290)stars(34450,1250)\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        from lyrics import _cache_path, _netease_cache_key
+        key = _netease_cache_key("Coldplay", "Yellow", "Parachutes", 269.0)
+        p = _cache_path(cache, key)
+        p.write_text(json.dumps({"yrc": yrc, "lrc": "", "fetched_at": 0.0}),
+                     encoding="utf-8")
+        result = fetch_netease("Coldplay", "Yellow", "Parachutes", 269.0,
+                               cache_dir=cache)
+        assert result is not None and result.source == "netease-cache"
+        assert result.has_word_sync and result.raw_kind == "yrc"
+        p.write_text(json.dumps(
+            {"yrc": "", "lrc": "[00:05.00] Look at the stars",
+             "fetched_at": 0.0}), encoding="utf-8")
+        result = fetch_netease("Coldplay", "Yellow", "Parachutes", 269.0,
+                               cache_dir=cache)
+        assert result is not None and not result.has_word_sync
+        assert result.raw_kind == "lrc"
+    print("  netease cache round-trip: OK (yrc word sync, LRC fallback)")
+
+
+def test_live_unison_fetch():
+    """Live check: Coldplay — Yellow via Unison returns word-synced
+    TTML. Skipped when offline or when Unison has no match."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = fetch_unison("Coldplay", "Yellow", "Parachutes", 269.0,
+                                  cache_dir=Path(tmp))
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live Unison test (offline: {e})")
+        return "skip"
+    if result is None:
+        print("  SKIP live Unison test (no match)")
+        return "skip"
+    assert result.has_word_sync, "Unison match had no word timings"
+    print(f"  live Unison: {len(result.synced_lines)} lines, word-synced, source={result.source}")
+    return "pass"
+
+
+def test_live_amll_fetch():
+    """Live check: YOASOBI — Idol via AMLL returns hand-timed TTML
+    (search, then fetch by id). Skipped when offline or no match."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = fetch_amll("YOASOBI", "Idol", "Idol", 196.0,
+                                cache_dir=Path(tmp))
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live AMLL test (offline: {e})")
+        return "skip"
+    if result is None:
+        print("  SKIP live AMLL test (no match)")
+        return "skip"
+    assert result.has_word_sync, "AMLL match had no word timings"
+    print(f"  live AMLL: {len(result.synced_lines)} lines, word-synced, source={result.source}")
+    return "pass"
+
+
+def test_live_netease_fetch():
+    """Live check: YOASOBI — Idol via NetEase returns synced lyrics
+    (yrc word-level when present, else line LRC). Skipped when
+    offline or when NetEase has no lyrics for the recording."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = fetch_netease("YOASOBI", "Idol", "Idol", 196.0,
+                                   cache_dir=Path(tmp))
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  SKIP live NetEase test (offline: {e})")
+        return "skip"
+    if result is None:
+        print("  SKIP live NetEase test (no match)")
+        return "skip"
+    assert result.has_synced, "NetEase match had no synced lyrics"
+    print(f"  live NetEase: {len(result.synced_lines)} lines, "
+          f"word-sync={result.has_word_sync}, source={result.source}")
+    return "pass"
 
 
 def test_live_qq_fetch():
@@ -534,6 +702,7 @@ TESTS = [
     test_parse_ttml_docs_example,
     test_parse_ttml_time_formats_and_bg,
     test_parse_ttml_syllable_parts,
+    test_parse_ttml_amll_namespace,
     test_elrc_word_parts,
     test_request_log,
     test_cache_roundtrip_keeps_word_tags,
@@ -541,6 +710,13 @@ TESTS = [
     test_parse_qrc_word_timings,
     test_parse_qrc_xml_wrapper,
     test_qq_cache_roundtrip,
+    test_parse_yrc_word_timings,
+    test_unison_cache_roundtrip,
+    test_amll_cache_roundtrip,
+    test_netease_cache_roundtrip,
+    test_live_unison_fetch,
+    test_live_amll_fetch,
+    test_live_netease_fetch,
     test_is_censored_detection,
     test_search_all_candidates_censored_sort,
     test_search_all_candidates_merges,

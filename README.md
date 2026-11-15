@@ -12,9 +12,10 @@ BetterLyrics is Windows-only (WinUI 3, Windows Media Transport Controls).
 On Linux the same job is actually easier: every player already publishes
 what's playing over **MPRIS**, and **Better Lyrics** serves word-synced
 lyrics (TTML, cache-first, no key) — plus its QQ provider (QRC,
-word-level) — with **LRCLIB** and Kugou as line-sync fallbacks. This
-app glues those together in a native Qt6 window — no Electron, no
-account, no API key.
+word-level), community uploads from **Unison**, hand-timed TTML from
+the **AMLL** database and word-level `yrc` from **NetEase** — with
+**LRCLIB** and Kugou as line-sync fallbacks. This app glues those
+together in a native Qt6 window — no Electron, no account, no API key.
 
 ## Screenshots
 
@@ -50,12 +51,12 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   effect on the sample lyrics.
 - **Choose lyrics** — if several versions of a song exist, `Lyrics >
   Choose lyrics…` (also in the Overlay menu and the tray menu) lists
-  every match from all four providers — Better Lyrics (syllable-sync),
-  QQ Music (word-sync), LRCLIB and Kugou — word-synced first, each
-  labelled with its provider, and rows whose lyrics are
-  asterisk-censored (`f**k`, `ni**a` …) carry a "censored" tag and
-  sort below uncensored matches at the same sync level. The pick
-  applies immediately and sticks for that track. `Lyrics > Re-fetch
+  every match from all seven providers — Better Lyrics (syllable-sync),
+  Unison, AMLL (hand-timed), QQ Music (word-sync), NetEase, LRCLIB and
+  Kugou — word-synced first, each labelled with its provider, and rows
+  whose lyrics are asterisk-censored (`f**k`, `ni**a` …) carry a
+  "censored" tag and sort below uncensored matches at the same sync
+  level. The pick applies immediately and sticks for that track. `Lyrics > Re-fetch
   lyrics (ignore cache)` drops the cached lyrics and pulls fresh,
   for when the cache has the wrong version.
 - **Lyrics debug** — `Help > Lyrics debug` (also in the Overlay
@@ -187,7 +188,10 @@ PlaybackEngine  (one poller, 250 ms, position interpolated
         │       with a monotonic clock between polls)
         ├─► Better Lyrics  GET /getLyrics?s=&a=&al=&d=  (TTML, word sync)
         │           (cache-first, no key; 401/429 → fall back)
+        ├─► Unison  GET /lyrics?song=&artist=&album=&duration=  (TTML/LRC, word sync)
+        ├─► AMLL  GET /v1/lyrics/search → /v1/lyrics/get?id=  (TTML, hand-timed)
         ├─► QQ Music  GET /qq/getLyrics  (QRC, word sync)
+        ├─► NetEase  GET /api/search/get → /api/song/lyric  (yrc, word sync when present)
         ├─► LRCLIB  GET /api/get?artist_name=&track_name=&album_name=&duration=
         │           (fallback /api/search; cached in ~/.cache/synced-lyrics-linux/)
         └─► Kugou  GET /kugou/getLyrics  (LRC, line sync, last resort)
@@ -212,6 +216,23 @@ Full App window  ⇄  Overlay window  ⇄  System tray
   start/duration in ms); the Kugou provider (`/kugou/getLyrics`)
   returns line-level LRC only and is the last resort. Docs:
   https://lyrics-api-docs.boidu.dev
+- **Unison:** `https://unison.betterlyrics.org/lyrics` — Better Lyrics'
+  community uploads, TTML or LRC, whatever was submitted. Same query
+  shape as the TTML endpoint, no key. Word-level when the upload is
+  TTML.
+- **AMLL TTML Database:** `https://api.amll.dev` — hand-timed,
+  syllable-level TTML, public domain, volunteer-run. Search
+  (`/v1/lyrics/search?musicName=&artistName=`) returns metadata only;
+  the best-scoring entry is then fetched by id
+  (`/v1/lyrics/get?id=`). The corpus is small (a few thousand songs),
+  so most tracks miss here — but when it has the song it's the most
+  accurate version anywhere.
+- **NetEase Cloud Music:** `https://music.163.com` — unofficial
+  web-player endpoints, no key. Search (`/api/search/get`) then
+  lyrics (`/api/song/lyric?id=`), which returns line-level `lrc` and
+  word-level `yrc` (same shape as QRC). `yrc` is empty for many
+  tracks, and some recordings have no lyrics at all — strongest for
+  East Asian music.
 - **LRCLIB:** `https://lrclib.net/api/get` returns `syncedLyrics` (LRC),
   `plainLyrics`, `instrumental`, `duration`. No key; the client sends
   `Lrclib-Client: synced-lyrics-linux/1.0`. Rate limits (~45 req/min
@@ -231,28 +252,32 @@ Full data-flow diagram: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Source | Sync level | Key? | When it's used |
 |---|---|---|---|
 | Better Lyrics API (`api.betterlyrics.org`) | Word / syllable (TTML) | No — cache-first, cached songs are free | First, for every track |
-| QQ Music via Better Lyrics (`/qq/getLyrics`) | Word (QRC) | No — cache-first | Second, when TTML has no match |
-| LRCLIB (`lrclib.net`) | Line (LRC); some records word-tagged | No | Third, when TTML and QQ have no match |
+| Unison (`unison.betterlyrics.org`) | Word (TTML) / line (LRC) | No | Second, when TTML has no match |
+| AMLL TTML Database (`api.amll.dev`) | Word / syllable (TTML, hand-timed) | No | Third, when TTML and Unison have no match |
+| QQ Music via Better Lyrics (`/qq/getLyrics`) | Word (QRC) | No — cache-first | Fourth, when TTML, Unison and AMLL have no match |
+| NetEase Cloud Music (`music.163.com`) | Word (yrc) when present, else line (LRC) | No | Fifth, when nothing word-synced matched yet |
+| LRCLIB (`lrclib.net`) | Line (LRC); some records word-tagged | No | Sixth, when the word-sync sources have no match |
 | Kugou via Better Lyrics (`/kugou/getLyrics`) | Line (LRC) | No — cache-first | Last resort, when nothing else matched |
 
-The picker (`Lyrics > Choose lyrics…`) pulls all four at once and
+The picker (`Lyrics > Choose lyrics…`) pulls all seven at once and
 lists every match, word-synced first.
 
 The status bar always names the real source, e.g. "Word-synced lyrics
 from Better Lyrics (38 lines)" or "Synced lyrics from LRCLIB (37
 lines)", with `[cached]` when the lyrics came from the disk cache
 (`~/.cache/synced-lyrics-linux/`, `bl-` prefix for Better Lyrics
-entries). Only artist/title/album/duration are ever sent to either
+entries). Only artist/title/album/duration are ever sent to any
 service. Lyrics are fetched at runtime and never shipped with the repo.
 
 ## Limitations
 
-- **Lyrics coverage depends on both providers.** Not every track has
+- **Lyrics coverage depends on the providers.** Not every track has
   synced lyrics; some have plain lyrics only, some have none. The app
   says so plainly ("No lyrics found") instead of guessing.
 - **Word sync needs word timings.** Only tracks with TTML word data
-  (Better Lyrics) or Enhanced-LRC word tags get word-by-word
-  highlighting; everything else is line-only, which still works fine.
+  (Better Lyrics, Unison, AMLL) or word-tagged formats (QQ QRC,
+  NetEase yrc, Enhanced-LRC) get word-by-word highlighting;
+  everything else is line-only, which still works fine.
 - **Sync can be off by a second or two** on some tracks — use the
   Sync `−0.5s` / `+0.5s` buttons; the offset is saved.
 - **Browsers report position in 1 s steps** — the app interpolates, so
@@ -299,5 +324,5 @@ or API keys.
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright William / konn-neko, 2026.
-Lyrics themselves are fetched at runtime from Better Lyrics and LRCLIB
-and are not shipped with this repo.
+Lyrics themselves are fetched at runtime from the seven lyric
+providers and are not shipped with this repo.

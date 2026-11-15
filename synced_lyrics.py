@@ -863,8 +863,14 @@ def _candidate_label(result) -> str:
              "instrumental" if result.instrumental else "no lyrics")
     if result.source.startswith("betterlyrics"):
         provider = "Better Lyrics"
+    elif result.source.startswith("unison"):
+        provider = "Unison"
+    elif result.source.startswith("amll"):
+        provider = "AMLL"
     elif result.source.startswith("qq"):
         provider = "QQ Music"
+    elif result.source.startswith("netease"):
+        provider = "NetEase"
     elif result.source.startswith("kugou"):
         provider = "Kugou"
     else:

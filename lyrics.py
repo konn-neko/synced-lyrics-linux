@@ -5,13 +5,28 @@ Providers, in order:
      syllable/word-level timing. Cache-first, no API key: cached songs
      are free, a cache miss without a key returns 401 and we fall back
      (never fail the track for it).
-  2. Better Lyrics QQ provider (/qq/getLyrics) — QRC, word-level
+  2. Unison (https://unison.betterlyrics.org) — Better Lyrics'
+     community uploads, TTML or LRC, whatever was submitted.
+     GET /lyrics?song=&artist=&album=&duration= — no key.
+  3. AMLL TTML Database (https://api.amll.dev) — hand-timed
+     syllable TTML, public domain, volunteer-run. Search returns
+     metadata only; lyrics come from a second GET by id.
+     GET /v1/lyrics/search?musicName=&artistName=&pageSize=
+     GET /v1/lyrics/get?id= — no key. Small corpus (a few thousand
+     songs), so most tracks miss here and fall through.
+  4. Better Lyrics QQ provider (/qq/getLyrics) — QRC, word-level
      timing (QQ Music). Same cache-first, no-key terms as TTML.
-  3. LRCLIB (https://lrclib.net) — free, no key. Line-level LRC,
+  5. NetEase Cloud Music (https://music.163.com) — word-level yrc
+     plus line LRC and translations. Unofficial web-player
+     endpoints, no key: GET /api/search/get?s=&type=1&limit=&offset=
+     then GET /api/song/lyric?id=&lv=-1&kv=-1&tv=-1. yrc is empty
+     for many tracks (then the LRC is used); some recordings have
+     no lyrics at all ("暂无歌词").
+  6. LRCLIB (https://lrclib.net) — free, no key. Line-level LRC,
      some records carry Enhanced-LRC word tags.
      GET /api/get?artist_name=&track_name=&album_name=&duration=
      GET /api/search?q=
-  4. Better Lyrics Kugou provider (/kugou/getLyrics) — line-level
+  7. Better Lyrics Kugou provider (/kugou/getLyrics) — line-level
      LRC. Last resort when LRCLIB has nothing.
 Responses carry plainLyrics, syncedLyrics (LRC), instrumental, duration.
 Rate limits: ~45 req/min generic, ~90/min identified (Lrclib-Client header).
@@ -33,6 +48,9 @@ from pathlib import Path
 
 LRCLIB_BASE = "https://lrclib.net"
 BETTERLYRICS_BASE = "https://api.betterlyrics.org"
+UNISON_BASE = "https://unison.betterlyrics.org"
+AMLL_BASE = "https://api.amll.dev"
+NETEASE_BASE = "https://music.163.com"
 CLIENT_HEADER = "synced-lyrics-linux/1.0"
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "synced-lyrics-linux"
 
@@ -144,7 +162,7 @@ class LyricsResult:
     # The raw lyrics file exactly as received (TTML or LRC text), for
     # the Help > Lyrics debug view. Empty for plain-only results.
     raw_text: str = ""
-    raw_kind: str = ""  # "ttml" | "lrc" | ""
+    raw_kind: str = ""  # "ttml" | "lrc" | "qrc" | "yrc" | ""
     cache_file: str = ""  # cache file this result came from / was saved to
     # The raw LRCLIB record this result was built from (None for
     # Better Lyrics / demo). Kept so a picked search candidate can be
@@ -368,6 +386,12 @@ def parse_ttml(text: str) -> list[LyricLine]:
     whitespace between them are merged into one word (syllables of the
     same word); a whitespace tail or trailing space in the span text
     ends a word. Lines with no timed spans keep words=[].
+
+    Elements are matched by local name, not namespace: some TTML
+    (AMLL's) resets the default namespace inside <div> (`xmlns=""`),
+    so its <p>/<span> elements are in no namespace at all, while
+    Better Lyrics' are in the TTML namespace. Matching
+    `{http://www.w3.org/ns/ttml}p` would miss the AMLL ones entirely.
     """
     if not text:
         return []
@@ -375,12 +399,17 @@ def parse_ttml(text: str) -> list[LyricLine]:
         root = ET.fromstring(text)
     except ET.ParseError:
         return []
-    ns = {"tt": _TTML_NS}
-    body = root.find("tt:body", ns)
+    body = None
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == "body":
+            body = el
+            break
     if body is None:
         body = root
     lines: list[LyricLine] = []
-    for p in body.iter(f"{{{_TTML_NS}}}p"):
+    for p in body.iter():
+        if p.tag.rsplit("}", 1)[-1] != "p":
+            continue
         begin = _parse_ttml_time(p.get("begin"))
         raw_spans: list[dict] = []
         _collect_ttml_spans(p, False, raw_spans)
@@ -395,6 +424,18 @@ def parse_ttml(text: str) -> list[LyricLine]:
         cur_parts: list[LyricWord] = []
         for span in raw_spans:
             if cur_begin is None:
+                cur_begin, cur_end, cur_bg = span["begin"], span["end"], span["is_background"]
+            if (cur_text.strip() and span["text"][:1] in " \t\n"):
+                # AMLL convention: the space starts the next word
+                # (" beat") instead of ending the previous one
+                # ("Look "). End the word being built first, so the
+                # sweep highlights word by word, not in merged chunks.
+                words.append(LyricWord(time=cur_begin, end=cur_end or cur_begin,
+                                       text=cur_text.strip(),
+                                       is_background=cur_bg,
+                                       parts=cur_parts))
+                cur_text, cur_begin, cur_end, cur_bg = "", None, None, False
+                cur_parts = []
                 cur_begin, cur_end, cur_bg = span["begin"], span["end"], span["is_background"]
             cur_text += span["text"]
             cur_end = span["end"]
@@ -414,10 +455,11 @@ def parse_ttml(text: str) -> list[LyricLine]:
                 if cur_parts:
                     cur_parts[-1].text += span["tail"].strip()
             if boundary:
-                words.append(LyricWord(time=cur_begin, end=cur_end or cur_begin,
-                                       text=cur_text.strip(),
-                                       is_background=cur_bg,
-                                       parts=cur_parts))
+                if cur_text.strip():
+                    words.append(LyricWord(time=cur_begin, end=cur_end or cur_begin,
+                                           text=cur_text.strip(),
+                                           is_background=cur_bg,
+                                           parts=cur_parts))
                 cur_text, cur_begin, cur_end, cur_bg = "", None, None, False
                 cur_parts = []
         if cur_text.strip() and cur_begin is not None:
@@ -695,6 +737,352 @@ def fetch_kugou(
     return result
 
 
+# ------------------------------------------------------- match scoring ---
+def _norm_text(s: str) -> str:
+    """Lowercase, punctuation-folded text for fuzzy title/artist matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _match_score(title: str, artist: str,
+                 cand_titles, cand_artists) -> int:
+    """0-4 score for a search candidate: title exact 2 / contains 1,
+    artist exact 2 / contains 1. Callers require >= 3 — a wrong song
+    that shares the title must not win on the title alone."""
+    t = _norm_text(title)
+    a = _norm_text(artist)
+    score = 0
+    for ct in cand_titles or []:
+        n = _norm_text(ct)
+        if n and n == t:
+            score += 2
+            break
+        if n and t and (n in t or t in n):
+            score += 1
+            break
+    for ca in cand_artists or []:
+        n = _norm_text(ca)
+        if not n or not a:
+            continue
+        if n == a:
+            score += 2
+            break
+        if n in a or a in n:
+            score += 1
+            break
+    return score
+
+
+def _get_json_url(url: str, headers: dict | None = None,
+                  timeout: float = 8.0) -> dict | None:
+    """GET a JSON payload. Returns the parsed dict, or None on any
+    HTTP/network/parse failure (callers fall through — never fail
+    the track for one provider). Every request is logged."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": CLIENT_HEADER,
+                      "Accept": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            log_request(url, f"HTTP {resp.status}", raw)
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        log_request(url, f"HTTP {e.code}", body)
+        return None
+    except Exception as e:
+        log_request(url, "network error", str(e))
+        return None
+
+
+def _unison_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
+    return "un-" + _cache_key(artist, track, album, duration)
+
+
+def _amll_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
+    return "am-" + _cache_key(artist, track, album, duration)
+
+
+def _netease_cache_key(artist: str, track: str, album: str, duration: float | None) -> str:
+    return "ne-" + _cache_key(artist, track, album, duration)
+
+
+def fetch_unison(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> LyricsResult | None:
+    """Fetch community lyrics from Unison (Better Lyrics' uploads).
+
+    GET /lyrics?song=&artist=&album=&duration= — no key. The payload
+    is {"success": bool, "data": {"lyrics": "...", "format":
+    "ttml"|"lrc"}}; TTML is word-level, LRC is parsed like any LRC
+    (Enhanced-LRC word tags included). Returns None on NOT_FOUND or
+    any error.
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _unison_cache_key(artist, track, album, duration)
+
+    def _from_raw(raw: str, fmt: str, source: str) -> LyricsResult | None:
+        if not raw:
+            return None
+        if fmt == "ttml" or raw.lstrip().startswith("<"):
+            lines = parse_ttml(raw)
+            kind = "ttml"
+        else:
+            lines = parse_lrc(raw)
+            kind = "lrc"
+        if not lines:
+            return None
+        return LyricsResult(
+            artist=artist, track=track, album=album, duration=duration,
+            synced_lines=lines, source=source, raw_text=raw, raw_kind=kind,
+            cache_file=str(_cache_path(cache, key)))
+
+    if use_cache:
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = _from_raw(data.get("raw") or "",
+                                   data.get("format") or "", "unison-cache")
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # corrupt cache: fall through to network
+
+    params = {"song": track, "artist": artist}
+    if album:
+        params["album"] = album
+    if duration is not None:
+        params["duration"] = str(int(round(duration)))
+    url = f"{UNISON_BASE}/lyrics?{urllib.parse.urlencode(params)}"
+    payload = _get_json_url(url)
+    if payload is None or not payload.get("success"):
+        return None
+    data = payload.get("data") or {}
+    raw = data.get("lyrics") or ""
+    fmt = (data.get("format") or "").lower()
+    result = _from_raw(raw, fmt, "unison")
+    if result is None:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        _cache_path(cache, key).write_text(
+            json.dumps({"raw": raw, "format": fmt, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def fetch_amll(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> LyricsResult | None:
+    """Fetch hand-timed syllable TTML from the AMLL TTML Database.
+
+    Two steps, no key: search returns metadata only
+    (GET /v1/lyrics/search?musicName=&artistName=&pageSize=), the
+    best-scoring entry is then fetched by id
+    (GET /v1/lyrics/get?id=). The corpus is small and hand-timed,
+    so a match here is high quality — but most tracks miss and fall
+    through. A match needs score >= 3 (see `_match_score`).
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _amll_cache_key(artist, track, album, duration)
+
+    def _from_ttml(ttml: str, source: str) -> LyricsResult | None:
+        lines = parse_ttml(ttml)
+        if not lines:
+            return None
+        return LyricsResult(
+            artist=artist, track=track, album=album, duration=duration,
+            synced_lines=lines, source=source, raw_text=ttml, raw_kind="ttml",
+            cache_file=str(_cache_path(cache, key)))
+
+    if use_cache:
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = _from_ttml(data.get("ttml") or "", "amll-cache")
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # corrupt cache: fall through to network
+
+    params = {"musicName": track, "pageSize": "10"}
+    if artist:
+        params["artistName"] = artist
+    search = _get_json_url(
+        f"{AMLL_BASE}/v1/lyrics/search?{urllib.parse.urlencode(params)}")
+    if search is None:
+        return None
+    items = (search.get("data") or {}).get("items") or []
+    best = None
+    best_score = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        score = _match_score(track, artist,
+                             item.get("musicNames") or [],
+                             item.get("artistNames") or [])
+        if score > best_score:
+            best_score = score
+            best = item
+    if best is None or best_score < 3 or not best.get("id"):
+        return None
+    got = _get_json_url(f"{AMLL_BASE}/v1/lyrics/get?id={best['id']}")
+    if got is None:
+        return None
+    ttml = (got.get("data") or {}).get("lyrics") or ""
+    result = _from_ttml(ttml, "amll")
+    if result is None:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        _cache_path(cache, key).write_text(
+            json.dumps({"ttml": ttml, "amll_id": best.get("id"),
+                        "fetched_at": time.time()}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def fetch_netease(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> LyricsResult | None:
+    """Fetch lyrics from NetEase Cloud Music (unofficial endpoints).
+
+    GET /api/search/get?s=&type=1&limit=&offset= (plain JSON, no key
+    — the /get/web variant returns an encrypted blob, this one does
+    not), then GET /api/song/lyric?id=&lv=-1&kv=-1&tv=-1. The `yrc`
+    field is word-level (same shape as QRC, parsed with `parse_qrc`);
+    when it is empty the line-level `lrc` is used. Some recordings
+    have no lyrics at all ("暂无歌词"). A Referer header is sent
+    (the web player's).
+    """
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+    if not artist or not track:
+        return None
+    album = (album or "").strip()
+    cache = cache_dir or DEFAULT_CACHE_DIR
+    key = _netease_cache_key(artist, track, album, duration)
+
+    def _from_payload(yrc: str, lrc: str, source: str) -> LyricsResult | None:
+        if yrc:
+            lines = parse_qrc(yrc)
+            if lines:
+                return LyricsResult(
+                    artist=artist, track=track, album=album, duration=duration,
+                    synced_lines=lines, source=source, raw_text=yrc, raw_kind="yrc",
+                    cache_file=str(_cache_path(cache, key)))
+        lines = parse_lrc(lrc)
+        if not lines:
+            return None
+        return LyricsResult(
+            artist=artist, track=track, album=album, duration=duration,
+            synced_lines=lines, source=source, raw_text=lrc, raw_kind="lrc",
+            cache_file=str(_cache_path(cache, key)))
+
+    if use_cache:
+        try:
+            p = _cache_path(cache, key)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = _from_payload(data.get("yrc") or "",
+                                       data.get("lrc") or "", "netease-cache")
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # corrupt cache: fall through to network
+
+    # Search: title + artist first, then title alone. Best score wins;
+    # duration breaks ties (NetEase reports it in milliseconds).
+    song_id = None
+    for term in (f"{track} {artist}".strip(), track):
+        params = {"s": term, "type": 1, "limit": 5, "offset": 0}
+        found = _get_json_url(
+            f"{NETEASE_BASE}/api/search/get?{urllib.parse.urlencode(params)}",
+            headers={"Referer": "https://music.163.com/"})
+        if found is None:
+            continue
+        songs = (found.get("result") or {}).get("songs") or []
+        best = None
+        best_key = None
+        for song in songs:
+            if not isinstance(song, dict) or not song.get("id"):
+                continue
+            score = _match_score(
+                track, artist, [song.get("name") or ""],
+                [a.get("name") or "" for a in (song.get("artists") or [])])
+            if score < 3:
+                continue
+            dur = song.get("duration")
+            diff = (abs(dur / 1000.0 - duration)
+                    if isinstance(dur, (int, float)) and duration else 9999.0)
+            cand_key = (score, -diff)
+            if best_key is None or cand_key > best_key:
+                best_key = cand_key
+                best = song
+        if best is not None:
+            song_id = best["id"]
+            break
+    if song_id is None:
+        return None
+
+    payload = _get_json_url(
+        f"{NETEASE_BASE}/api/song/lyric?id={song_id}&lv=-1&kv=-1&tv=-1",
+        headers={"Referer": "https://music.163.com/"})
+    if payload is None:
+        return None
+    yrc = ((payload.get("yrc") or {}).get("lyric") or "")
+    lrc = ((payload.get("lrc") or {}).get("lyric") or "")
+    if "暂无歌词" in lrc and not yrc:
+        return None
+    result = _from_payload(yrc, lrc, "netease")
+    if result is None:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        _cache_path(cache, key).write_text(
+            json.dumps({"yrc": yrc, "lrc": lrc, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
 def search_all_candidates(
     artist: str,
     track: str,
@@ -703,14 +1091,16 @@ def search_all_candidates(
 ) -> list[LyricsResult]:
     """All lyric candidates for the picker, word-synced first.
 
-    Better Lyrics TTML (single best match) + QQ QRC (word-level) +
-    Kugou LRC + LRCLIB search results. Each provider is best-effort:
-    one returning None just contributes nothing. Sorted: word-synced
-    first (TTML, then QQ, then word-tagged LRCLIB), then synced,
-    then plain-only — provider order kept within each rank.
+    Better Lyrics TTML (single best match) + Unison + AMLL + QQ QRC
+    (word-level) + NetEase + Kugou LRC + LRCLIB search results. Each
+    provider is best-effort: one returning None just contributes
+    nothing. Sorted: word-synced first (TTML, then Unison, AMLL, QQ,
+    word-tagged LRCLIB), then synced, then plain-only — uncensored
+    above censored within each rank, provider order within that.
     """
     candidates: list[LyricsResult] = []
-    for fn in (fetch_betterlyrics, fetch_qq, fetch_kugou):
+    for fn in (fetch_betterlyrics, fetch_unison, fetch_amll, fetch_qq,
+               fetch_netease, fetch_kugou):
         try:
             result = fn(artist, track, album, duration)
         except Exception:
@@ -726,11 +1116,17 @@ def search_all_candidates(
     def _provider_rank(r: LyricsResult) -> int:
         if r.source.startswith("betterlyrics"):
             return 0
-        if r.source.startswith("qq"):
+        if r.source.startswith("unison"):
             return 1
-        if r.source == "search":
+        if r.source.startswith("amll"):
             return 2
-        return 3
+        if r.source.startswith("qq"):
+            return 3
+        if r.source.startswith("netease"):
+            return 4
+        if r.source == "search":
+            return 5
+        return 6
 
     def _rank(r: LyricsResult):
         sync = 0 if r.has_word_sync else (1 if r.has_synced else 2)
@@ -934,8 +1330,8 @@ def clear_track_cache(
     duration: float | None = None,
     cache_dir: Path | None = None,
 ) -> int:
-    """Delete all cache files for a track (Better Lyrics TTML + QQ +
-    Kugou + LRCLIB).
+    """Delete all cache files for a track (Better Lyrics TTML +
+    Unison + AMLL + QQ + NetEase + Kugou + LRCLIB).
 
     Used by a forced re-pull: the cached lyrics were wrong, so they
     must not survive a failed re-fetch either. Returns how many files
@@ -945,7 +1341,10 @@ def clear_track_cache(
     cache = cache_dir or DEFAULT_CACHE_DIR
     removed = 0
     for key in (_betterlyrics_cache_key(artist, track, album, duration),
+                _unison_cache_key(artist, track, album, duration),
+                _amll_cache_key(artist, track, album, duration),
                 _qq_cache_key(artist, track, album, duration),
+                _netease_cache_key(artist, track, album, duration),
                 _kg_cache_key(artist, track, album, duration),
                 _cache_key(artist, track, album, duration)):
         try:

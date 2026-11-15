@@ -550,14 +550,20 @@ def test_engine_refetch_ignores_cache(app):
     from lyrics import LyricsResult
 
     orig_bl = playback.fetch_betterlyrics
+    orig_un = playback.fetch_unison
+    orig_am = playback.fetch_amll
     orig_qq = playback.fetch_qq
+    orig_ne = playback.fetch_netease
     orig_lrc = playback.fetch_lrclib
     orig_kg = playback.fetch_kugou
     orig_clear = playback.clear_track_cache
     cleared = []
     playback.clear_track_cache = lambda *a, **k: cleared.append(True) or 1
     playback.fetch_betterlyrics = lambda *a, **k: None
+    playback.fetch_unison = lambda *a, **k: None
+    playback.fetch_amll = lambda *a, **k: None
     playback.fetch_qq = lambda *a, **k: None
+    playback.fetch_netease = lambda *a, **k: None
     playback.fetch_kugou = lambda *a, **k: None
     fresh = LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
                          duration=269.0, synced_lines=[LyricLine(5.0, "Fresh line")],
@@ -580,7 +586,10 @@ def test_engine_refetch_ignores_cache(app):
             engine.stop()
     finally:
         playback.fetch_betterlyrics = orig_bl
+        playback.fetch_unison = orig_un
+        playback.fetch_amll = orig_am
         playback.fetch_qq = orig_qq
+        playback.fetch_netease = orig_ne
         playback.fetch_lrclib = orig_lrc
         playback.fetch_kugou = orig_kg
         playback.clear_track_cache = orig_clear

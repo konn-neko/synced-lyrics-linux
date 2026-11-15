@@ -23,10 +23,13 @@ from lyrics import (
     cache_lrclib_record,
     clear_track_cache,
     demo_result,
+    fetch_amll,
     fetch_betterlyrics,
     fetch_kugou,
     fetch_lrclib,
+    fetch_netease,
     fetch_qq,
+    fetch_unison,
     search_all_candidates,
 )
 
@@ -93,14 +96,24 @@ class _LyricsWorker(QObject):
                 # failed re-pull can't leave the wrong ones in place.
                 clear_track_cache(artist, track, album, duration)
             # Provider order: Better Lyrics TTML (word sync) first,
-            # then QQ QRC (word sync), LRCLIB, then Kugou (line sync).
-            # A provider returning None just falls through to the next
-            # — the track never fails for one provider.
+            # then Unison, AMLL (hand-timed TTML), QQ QRC (word sync),
+            # NetEase (yrc word sync when present), LRCLIB, then
+            # Kugou (line sync). A provider returning None just falls
+            # through to the next — the track never fails for one.
             result = fetch_betterlyrics(artist, track, album, duration,
                                         use_cache=not force)
             if result is None:
+                result = fetch_unison(artist, track, album, duration,
+                                      use_cache=not force)
+            if result is None:
+                result = fetch_amll(artist, track, album, duration,
+                                    use_cache=not force)
+            if result is None:
                 result = fetch_qq(artist, track, album, duration,
                                   use_cache=not force)
+            if result is None:
+                result = fetch_netease(artist, track, album, duration,
+                                       use_cache=not force)
             if result is None:
                 result = fetch_lrclib(artist, track, album, duration,
                                       use_cache=not force)
@@ -298,14 +311,20 @@ class PlaybackEngine(QObject):
         self.lyrics = result
         self.lyrics_changed.emit(result)
         if result is None:
-            self.status_changed.emit("No lyrics found (Better Lyrics + QQ + LRCLIB + Kugou) for this track")
+            self.status_changed.emit("No lyrics found (7 providers checked) for this track")
         elif result.instrumental:
             self.status_changed.emit("Instrumental — no lyrics (LRCLIB)")
         elif result.has_synced:
             if result.source.startswith("betterlyrics"):
                 provider = "Better Lyrics"
+            elif result.source.startswith("unison"):
+                provider = "Unison"
+            elif result.source.startswith("amll"):
+                provider = "AMLL"
             elif result.source.startswith("qq"):
                 provider = "QQ Music"
+            elif result.source.startswith("netease"):
+                provider = "NetEase"
             elif result.source.startswith("kugou"):
                 provider = "Kugou"
             else:
@@ -317,7 +336,7 @@ class PlaybackEngine(QObject):
         elif result.plain_lyrics:
             self.status_changed.emit("Plain lyrics only — no sync data")
         else:
-            self.status_changed.emit("No lyrics found (Better Lyrics + QQ + LRCLIB + Kugou) for this track")
+            self.status_changed.emit("No lyrics found (7 providers checked) for this track")
         self._emit_position()
 
     def current_position(self) -> float:
@@ -413,8 +432,14 @@ class PlaybackEngine(QObject):
                  "plain" if result.plain_lyrics else "no lyrics")
         if result.source.startswith("betterlyrics"):
             provider = "Better Lyrics"
+        elif result.source.startswith("unison"):
+            provider = "Unison"
+        elif result.source.startswith("amll"):
+            provider = "AMLL"
         elif result.source.startswith("qq"):
             provider = "QQ Music"
+        elif result.source.startswith("netease"):
+            provider = "NetEase"
         elif result.source.startswith("kugou"):
             provider = "Kugou"
         else:

@@ -18,9 +18,9 @@ no login, no API keys.
 |---|---|
 | `synced_lyrics.py` | Entry point + all UI: `FullAppWindow`, `OverlayWindow` (+ `ClickThroughHandle`), `AppController`, tray, display picker, CLI (`--mode`, `--screen`, `--demo`, `--test-lyrics`). |
 | `koneko_lyrics.py` | 3-line shim: imports `main` from `synced_lyrics.py`. Kept so the old `python3 koneko_lyrics.py` command still works. |
-| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, `MonotonicPosition` interpolated position (never goes backwards — see MPRIS), lyrics fetch in a worker thread (Better Lyrics TTML first, LRCLIB fallback). Both windows + tray render from it; never create a second poller. `word_index_at(pos)` gives the (line, word) active at a position. |
+| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, `MonotonicPosition` interpolated position (never goes backwards — see MPRIS), lyrics fetch in a worker thread (Better Lyrics TTML first, then Unison, AMLL, QQ, NetEase, LRCLIB, Kugou). Both windows + tray render from it; never create a second poller. `word_index_at(pos)` gives the (line, word) active at a position. |
 | `mpris.py` | MPRIS client. Primary: `PySide6.QtDBus`. Fallback: `playerctl` CLI. `list_players()`, `get_track()`, `play_pause()`, `next_track()`, `previous_track()`, `seek()`. `TrackInfo` dataclass. |
-| `lyrics.py` | TTML + LRC parsers and both lyrics clients. `parse_ttml()`, `parse_lrc()` (incl. Enhanced-LRC word tags), `fetch_betterlyrics()`, `fetch_lrclib()`, `LyricsResult`, `LyricLine`, `LyricWord`, `LRCLIBRateLimited`, `demo_result()` (demo lines get proportional word timings so `--demo` shows word highlight). |
+| `lyrics.py` | TTML + LRC + QRC + yrc parsers and seven lyrics clients. `parse_ttml()`, `parse_lrc()` (incl. Enhanced-LRC word tags), `parse_qrc()` (QRC + NetEase yrc), `fetch_betterlyrics()`, `fetch_unison()`, `fetch_amll()`, `fetch_qq()`, `fetch_netease()`, `fetch_lrclib()`, `fetch_kugou()`, `search_all_candidates()`, `LyricsResult`, `LyricLine`, `LyricWord`, `LRCLIBRateLimited`, `demo_result()` (demo lines get proportional word timings so `--demo` shows word highlight). |
 | `test_lyrics.py` | Tests for `lyrics.py` only (no Qt needed). Runnable as `python3 test_lyrics.py` or `pytest`. |
 | `install.sh` | CachyOS/Arch one-command install: pacman `pyside6` + `playerctl`, launcher `~/.local/bin/synced-lyrics`, desktop file `~/.local/share/applications/synced-lyrics-linux.desktop`. |
 | `requirements.txt` | `PySide6>=6.6` — pip fallback only; prefer the distro package. |
@@ -73,9 +73,9 @@ no login, no API keys.
   None (fall back) rather than blocking; honour `Retry-After` by not
   retrying. `/revalidate` needs a key and is not used.
 - The Kugou (`/kugou/getLyrics`) and QQ (`/qq/getLyrics`) endpoints
-  were checked live and are NOT wired in: they return
-  `{"lyrics": ..., "provider": ...}` — line-level LRC for Kugou, QRC
-  XML for QQ — not TTML. LRCLIB already covers line-level.
+  are wired in too (see "Word-sync sources" below): Kugou returns
+  line-level LRC, QQ returns QRC XML — not TTML, but both are real
+  providers now.
 - Cache: `~/.cache/synced-lyrics-linux/bl-<sha256>.json` (raw TTML +
   `fetched_at`); cache reads re-parse identically, source
   `"betterlyrics-cache"` (network: `"betterlyrics"`).
@@ -237,8 +237,8 @@ no login, no API keys.
   and the pick applies immediately. The pick is cached verbatim under
   the current track's key (`cache_lrclib_record`), so the next lookup
   loads it directly. **Lyrics > Re-fetch lyrics (ignore cache)** drops
-  all four cache files for the track (`clear_track_cache`: bl-, qq-,
-  kg-, lrclib) and pulls fresh — for when the cached lyrics are wrong.
+  all seven cache files for the track (`clear_track_cache`: bl-, un-,
+  am-, qq-, ne-, kg-, lrclib) and pulls fresh — for when the cached lyrics are wrong.
   Worker side: `_LyricsWorker.search` calls `search_all_candidates`
   and `PlaybackEngine.search_lyrics_candidates` / `apply_candidate` /
   `refetch_lyrics` (fetch takes `force`, which passes `use_cache=False`).
@@ -246,22 +246,43 @@ no login, no API keys.
   syncedLyrics from parsed lines, which dropped Enhanced-LRC word
   tags — a cached track lost word sync on reload. It now caches the
   raw record verbatim.
-- Word-sync sources: four providers, no keys, no logins. **Better
-  Lyrics TTML** (`/getLyrics`, syllable-level) is first; **QQ Music
-  QRC** (`/qq/getLyrics`, word-level, `parse_qrc` — line `[startMs,
-  durMs]`, word timing follows the word text, whitespace-only
-  segments are separators) is second; **LRCLIB** (line-level, some
-  records Enhanced-LRC word tags) third; **Kugou** (`/kugou/getLyrics`,
-  line-level LRC only) last. Auto-fetch tries them in that order;
-  the picker (`search_all_candidates`) merges all four and sorts
-  word-synced first, provider order within each rank. Caches:
-  `bl-<key>.json` (TTML), `qq-<key>.json` (QRC), `kg-<key>.json`
-  (LRC), `<key>.json` (LRCLIB record). `clear_track_cache` removes
-  all four. Gotcha: QRC's LyricContent must be pulled from the raw
+- Word-sync sources: seven providers, no keys, no logins. **Better
+  Lyrics TTML** (`/getLyrics`, syllable-level) is first; **Unison**
+  (`unison.betterlyrics.org/lyrics`, community uploads, TTML or LRC)
+  second; **AMLL TTML Database** (`api.amll.dev`, hand-timed
+  syllable TTML — search returns metadata only, lyrics come from a
+  second GET by id; small corpus, best accuracy when it has the
+  song) third; **QQ Music QRC** (`/qq/getLyrics`, word-level,
+  `parse_qrc` — line `[startMs, durMs]`, word timing follows the
+  word text, whitespace-only segments are separators) fourth;
+  **NetEase** (`music.163.com/api/search/get` then
+  `/api/song/lyric`, word-level `yrc` — same shape as QRC, parsed
+  with `parse_qrc` — when it is empty the line `lrc` is used; some
+  recordings have no lyrics at all, "暂无歌词") fifth; **LRCLIB**
+  (line-level, some records Enhanced-LRC word tags) sixth; **Kugou**
+  (`/kugou/getLyrics`, line-level LRC only) last. Auto-fetch tries
+  them in that order; the picker (`search_all_candidates`) merges
+  all seven and sorts word-synced first, uncensored above censored
+  at the same sync level, provider order within that. Caches:
+  `bl-<key>.json` (TTML), `un-<key>.json` (Unison),
+  `am-<key>.json` (AMLL TTML), `qq-<key>.json` (QRC),
+  `ne-<key>.json` (yrc + lrc), `kg-<key>.json` (LRC),
+  `<key>.json` (LRCLIB record). `clear_track_cache` removes all
+  seven. Gotcha: QRC's LyricContent must be pulled from the raw
   XML with a regex — an XML parser normalizes its newlines to
-  spaces and merges every line into one. Musixmatch (needs an API
-  key) and Apple Music (needs a developer token) are NOT viable
-  under the no-keys rule, so they are not wired in.
+  spaces and merges every line into one. Gotcha 2: AMLL TTML resets
+  the default namespace inside `<div>` (`xmlns=""`), so its
+  `<p>`/`<span>` elements are in NO namespace — `parse_ttml`
+  matches elements by local name, not by the TTML namespace, or it
+  finds zero lines. Gotcha 3: AMLL puts the space at the START of
+  the next word's span (" beat") where Better Lyrics puts it at the
+  END of the previous one ("Look ") — `parse_ttml` ends the word
+  being built when a span's text starts with whitespace, or the
+  sweep merges whole chunks. NetEase's `/api/search/get/web`
+  variant returns an ENCRYPTED blob — the plain `/api/search/get`
+  is the one to use. Musixmatch (needs an API key) and Apple Music
+  (needs a developer token) are NOT viable under the no-keys rule,
+  so they are not wired in.
 - Explicit / censored lyrics: there is NO explicit filter on any
   provider — the censoring is baked into the data. Better Lyrics
   TTML is uncensored (Kendrick — HUMBLE. returns fuck/shit/bitch
@@ -278,9 +299,9 @@ no login, no API keys.
   the Better Lyrics browser extension — it caches the uncensored
   TTML, and the app picks it up from then on.
 - Debug: `lyrics.py` logs EVERY HTTP request it makes (Better Lyrics
-  + LRCLIB + QQ + Kugou, via `log_request(url, status, body)` in
-  `_get_json`, `fetch_betterlyrics` and `_fetch_betterlyrics_provider`;
-  album-art fetches in `synced_lyrics.py` `_load_art` log too) —
+  + Unison + AMLL + NetEase + LRCLIB + QQ + Kugou, via `log_request(url, status, body)` in
+  `_get_json`, `fetch_betterlyrics`, `_fetch_betterlyrics_provider`
+  and `_get_json_url`; album-art fetches in `synced_lyrics.py` `_load_art` log too) —
   last 20, bodies capped at 200k chars.
   `LyricsResult` carries `raw_text` / `raw_kind` (the raw TTML or LRC
   exactly as received) and `cache_file`. Help > Lyrics debug
@@ -318,7 +339,10 @@ no login, no API keys.
   (offset, font_size, display, minimise_to_tray, overlay_opacity,
   overlay_click_through, line_animations, last_player).
 - Lyrics cache: `~/.cache/synced-lyrics-linux/*.json` — LRCLIB records
-  as `<sha256>.json`, Better Lyrics TTML as `bl-<sha256>.json`.
+  as `<sha256>.json`, Better Lyrics TTML as `bl-<sha256>.json`,
+  Unison as `un-<sha256>.json`, AMLL as `am-<sha256>.json`, QQ QRC as
+  `qq-<sha256>.json`, NetEase as `ne-<sha256>.json`, Kugou as
+  `kg-<sha256>.json`.
 - Album art cache: `~/.cache/synced-lyrics-linux/art/`.
 
 ## How to run tests headless
@@ -348,8 +372,9 @@ offscreen has one virtual display, so `--screen 1` falls back to primary.
 1. Add a `fetch_<provider>()` in `lyrics.py` returning `LyricsResult`
    (or `None`), same shape as `fetch_betterlyrics()` / `fetch_lrclib()`.
 2. Call it from `playback.py: _LyricsWorker.fetch` in the chain
-   (Better Lyrics TTML first, LRCLIB second — keep that order unless
-   the new provider has word sync and a keyless cache-first model).
+   (Better Lyrics TTML first, then Unison, AMLL, QQ, NetEase, LRCLIB,
+   Kugou — word-sync sources before line-only ones; keep that order
+   unless the new provider has word sync and a keyless cache-first model).
    A provider that returns None on 401/429 must never fail the track.
 3. Set `result.source` to the provider name so the status bar is honest.
 4. Add a parser test in `test_lyrics.py` if the format differs from LRC.
