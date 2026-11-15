@@ -29,10 +29,12 @@ from lyrics import (  # noqa: E402
     fetch_betterlyrics,
     fetch_kugou,
     fetch_lrclib,
+    fetch_lyrics,
     fetch_netease,
     fetch_qq,
     fetch_unison,
     is_censored_text,
+    normalise_provider_prefs,
     log_request,
     parse_lrc,
     parse_qrc,
@@ -456,6 +458,100 @@ def test_search_all_candidates_censored_sort():
     print("  censored sort: OK (clean word-sync, asterisked word-sync, clean line, asterisked line)")
 
 
+def test_normalise_provider_prefs():
+    """Stale config: unknown keys dropped, missing providers appended
+    (on), enabled defaults to True."""
+    order, enabled = normalise_provider_prefs(["lrclib", "bogus"], {"lrclib": False})
+    assert order[0] == "lrclib" and "bogus" not in order
+    assert len(order) == 7 and set(order) == set(
+        ["betterlyrics", "unison", "amll", "qq", "netease", "lrclib", "kugou"])
+    assert enabled["lrclib"] is False and enabled["qq"] is True
+    order2, enabled2 = normalise_provider_prefs(None, None)
+    assert order2[0] == "betterlyrics" and all(enabled2.values())
+    print("  normalise_provider_prefs: OK")
+
+
+def test_fetch_lyrics_order_enabled_word_only():
+    """fetch_lyrics honours the Preferences order, skips disabled
+    providers, and with word_only skips line-only results."""
+    def _res(source, word):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
+        return LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
+                            duration=269.0, synced_lines=[line], source=source)
+
+    names = ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_lrclib", "fetch_kugou")
+    orig = {name: getattr(_lyrics_module, name) for name in names}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", word=True)
+        _lyrics_module.fetch_unison = lambda *a, **k: _res("unison", word=True)
+        _lyrics_module.fetch_amll = lambda *a, **k: None
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", word=True)
+        _lyrics_module.fetch_netease = lambda *a, **k: _res("netease", word=False)
+        _lyrics_module.fetch_lrclib = lambda *a, **k: _res("lrclib", word=False)
+        _lyrics_module.fetch_kugou = lambda *a, **k: _res("kugou", word=False)
+        # Default order: Better Lyrics wins.
+        assert fetch_lyrics("Coldplay", "Yellow").source == "betterlyrics"
+        # Custom order: LRCLIB first wins.
+        assert fetch_lyrics("Coldplay", "Yellow",
+                            order=["lrclib", "betterlyrics"]).source == "lrclib"
+        # Disabled provider is skipped entirely.
+        assert fetch_lyrics("Coldplay", "Yellow",
+                            enabled={"betterlyrics": False}).source == "unison"
+        # word_only: line-only results are skipped, next word result wins.
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", word=False)
+        _lyrics_module.fetch_unison = lambda *a, **k: _res("unison", word=False)
+        assert fetch_lyrics("Coldplay", "Yellow",
+                            word_only=True).source == "qq"
+        # word_only with nothing word-synced anywhere: None, not line-only.
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", word=False)
+        assert fetch_lyrics("Coldplay", "Yellow", word_only=True) is None
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    print("  fetch_lyrics order/enabled/word_only: OK")
+
+
+def test_search_all_candidates_word_only_and_order():
+    """Picker respects a custom order and drops line-only results
+    under word_only."""
+    def _res(source, word, track="Yellow"):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
+        return LyricsResult(artist="Coldplay", track=track, album="Parachutes",
+                            duration=269.0, synced_lines=[line], source=source)
+
+    names = ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_kugou", "search_lrclib")
+    orig = {name: getattr(_lyrics_module, name) for name in names}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: _res("betterlyrics", word=True)
+        _lyrics_module.fetch_unison = lambda *a, **k: None
+        _lyrics_module.fetch_amll = lambda *a, **k: None
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", word=False)
+        _lyrics_module.fetch_netease = lambda *a, **k: None
+        _lyrics_module.fetch_kugou = lambda *a, **k: _res("kugou", word=False)
+        _lyrics_module.search_lrclib = lambda *a, **k: [_res("search", word=True)]
+        # word_only: QQ + Kugou line results are gone.
+        results = search_all_candidates("Coldplay", "Yellow", word_only=True)
+        assert [r.source for r in results] == ["betterlyrics", "search"]
+        # Custom order: QQ's provider rank moves ahead of LRCLIB search
+        # within the same sync level (word-synced still sorts first,
+        # and LRCLIB search now outranks Better Lyrics in this order).
+        results = search_all_candidates(
+            "Coldplay", "Yellow", order=["qq", "lrclib", "betterlyrics"])
+        assert [r.source for r in results] == ["search", "betterlyrics", "qq", "kugou"]
+        # Disabled LRCLIB: no search results at all.
+        results = search_all_candidates(
+            "Coldplay", "Yellow", enabled={"lrclib": False})
+        assert all(r.source != "search" for r in results)
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    print("  search_all_candidates order/word_only: OK")
+
+
 def test_parse_ttml_amll_namespace():
     """AMLL TTML resets the default namespace inside <div>
     (xmlns=""), so its <p>/<span> elements are in NO namespace.
@@ -703,6 +799,9 @@ TESTS = [
     test_parse_ttml_time_formats_and_bg,
     test_parse_ttml_syllable_parts,
     test_parse_ttml_amll_namespace,
+    test_normalise_provider_prefs,
+    test_fetch_lyrics_order_enabled_word_only,
+    test_search_all_candidates_word_only_and_order,
     test_elrc_word_parts,
     test_request_log,
     test_cache_roundtrip_keeps_word_tags,

@@ -549,26 +549,14 @@ def test_engine_refetch_ignores_cache(app):
     import playback
     from lyrics import LyricsResult
 
-    orig_bl = playback.fetch_betterlyrics
-    orig_un = playback.fetch_unison
-    orig_am = playback.fetch_amll
-    orig_qq = playback.fetch_qq
-    orig_ne = playback.fetch_netease
-    orig_lrc = playback.fetch_lrclib
-    orig_kg = playback.fetch_kugou
+    orig_fetch = playback.fetch_lyrics
     orig_clear = playback.clear_track_cache
     cleared = []
     playback.clear_track_cache = lambda *a, **k: cleared.append(True) or 1
-    playback.fetch_betterlyrics = lambda *a, **k: None
-    playback.fetch_unison = lambda *a, **k: None
-    playback.fetch_amll = lambda *a, **k: None
-    playback.fetch_qq = lambda *a, **k: None
-    playback.fetch_netease = lambda *a, **k: None
-    playback.fetch_kugou = lambda *a, **k: None
     fresh = LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
                          duration=269.0, synced_lines=[LyricLine(5.0, "Fresh line")],
                          source="lrclib")
-    playback.fetch_lrclib = lambda *a, **k: fresh
+    playback.fetch_lyrics = lambda *a, **k: fresh
     try:
         engine = playback.PlaybackEngine(demo=False)
         try:
@@ -585,13 +573,7 @@ def test_engine_refetch_ignores_cache(app):
         finally:
             engine.stop()
     finally:
-        playback.fetch_betterlyrics = orig_bl
-        playback.fetch_unison = orig_un
-        playback.fetch_amll = orig_am
-        playback.fetch_qq = orig_qq
-        playback.fetch_netease = orig_ne
-        playback.fetch_lrclib = orig_lrc
-        playback.fetch_kugou = orig_kg
+        playback.fetch_lyrics = orig_fetch
         playback.clear_track_cache = orig_clear
     print("  engine refetch: OK (cache cleared, fresh result applied)")
 
@@ -665,6 +647,133 @@ def test_lyrics_delegate_and_scroll(app):
     print("  lyrics delegate + scroll: OK (HTML paints, wraps, ScrollPerPixel)")
 
 
+def test_preferences_dialog(app):
+    """Preferences dialog: reordering + disabling a provider, word-only,
+    offset/font changes land in new_cfg on OK; Cancel discards."""
+    import synced_lyrics as _sl
+    from synced_lyrics import PreferencesDialog
+
+    cfg = dict(DEFAULT_CONFIG)
+    dlg = PreferencesDialog(None, cfg)
+    try:
+        # Move LRCLIB (last) up one, uncheck Kugou, turn word-only on.
+        dlg.provider_list.setCurrentRow(5)  # lrclib
+        dlg._move_provider(-1)
+        for i in range(dlg.provider_list.count()):
+            item = dlg.provider_list.item(i)
+            if item.data(Qt.UserRole) == "kugou":
+                item.setCheckState(Qt.Unchecked)
+        dlg.word_only_box.setChecked(True)
+        dlg.offset_spin.setValue(1.5)
+        dlg.font_spin.setValue(20)
+        dlg.anim_box.setChecked(False)
+        dlg.start_combo.setCurrentIndex(1)  # Overlay
+        dlg.opacity_slider.setValue(70)
+        dlg.accept()
+        assert dlg.new_cfg is not None
+        assert dlg.new_cfg["provider_order"][4] == "lrclib"
+        assert dlg.new_cfg["provider_enabled"]["kugou"] is False
+        assert dlg.new_cfg["provider_enabled"]["lrclib"] is True
+        assert dlg.new_cfg["word_only"] is True
+        assert dlg.new_cfg["offset"] == 1.5
+        assert dlg.new_cfg["font_size"] == 20
+        assert dlg.new_cfg["line_animations"] is False
+        assert dlg.new_cfg["start_mode"] == "overlay"
+        assert dlg.new_cfg["overlay_opacity"] == 0.7
+        # Defaults restore: all seven on, registry order.
+        dlg2 = PreferencesDialog(None, dict(DEFAULT_CONFIG))
+        try:
+            dlg2._restore_provider_defaults()
+            dlg2.accept()
+            assert dlg2.new_cfg["provider_order"] == [
+                "betterlyrics", "unison", "amll", "qq", "netease",
+                "lrclib", "kugou"]
+            assert all(dlg2.new_cfg["provider_enabled"].values())
+        finally:
+            dlg2.close()
+        # Cancel: new_cfg stays None, the caller's cfg is untouched.
+        dlg3 = PreferencesDialog(None, dict(DEFAULT_CONFIG))
+        try:
+            dlg3.word_only_box.setChecked(True)
+            dlg3.reject()
+            assert dlg3.new_cfg is None
+        finally:
+            dlg3.close()
+        # Cache clear: works on a temp cache dir, deletes only *.json.
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = _sl.Path(tmp)
+            (cache / "bl-abc.json").write_text("{}", encoding="utf-8")
+            (cache / "keep.txt").write_text("x", encoding="utf-8")
+            orig_cache = _sl.DEFAULT_CACHE_DIR
+            _sl.DEFAULT_CACHE_DIR = cache
+            try:
+                dlg4 = PreferencesDialog(None, dict(DEFAULT_CONFIG))
+                try:
+                    assert "1 cached track" in dlg4.cache_label.text()
+                    dlg4._clear_cache()
+                    assert not (cache / "bl-abc.json").exists()
+                    assert (cache / "keep.txt").exists()
+                finally:
+                    dlg4.close()
+            finally:
+                _sl.DEFAULT_CACHE_DIR = orig_cache
+    finally:
+        dlg.close()
+    print("  preferences dialog: OK (order/disable/word-only/offset/font/start/cancel/cache clear)")
+
+
+def test_engine_lyrics_prefs(app):
+    """Engine set_lyrics_prefs: normalises, stores, hands to the worker."""
+    engine = PlaybackEngine(demo=True)
+    try:
+        engine.set_lyrics_prefs(["lrclib", "bogus"], {"lrclib": False}, True)
+        assert engine.provider_order[0] == "lrclib"
+        assert "bogus" not in engine.provider_order
+        assert len(engine.provider_order) == 7
+        assert engine.provider_enabled["lrclib"] is False
+        assert engine.word_only is True
+        assert engine._worker.lyrics_prefs[2] is True
+        engine.set_lyrics_prefs(None, None, False)
+        assert engine.provider_order[0] == "betterlyrics"
+        assert engine.word_only is False
+    finally:
+        engine.stop()
+    print("  engine lyrics prefs: OK (normalise + worker handoff)")
+
+
+def test_engine_clears_lyrics_on_new_track(app):
+    """A new track clears the displayed lyrics at once — the old
+    song's lines must not linger while the new lookup runs."""
+    import mpris
+    engine = PlaybackEngine(demo=False)
+    try:
+        demo_result = LyricsResult(
+            artist="Coldplay", track="Yellow", album="Parachutes",
+            duration=269.0, synced_lines=[LyricLine(5.0, "Look at the stars")],
+            source="lrclib")
+        engine.lyrics = demo_result
+        seen = []
+        engine.lyrics_changed.connect(lambda r: seen.append(r))
+        track = mpris.TrackInfo(
+            player="test", title="Viva La Vida", artist="Coldplay",
+            album="Viva la Vida", duration=242.0, status="Playing")
+        engine._fetch_lyrics(track)
+        assert engine.lyrics is None, "old lyrics not cleared on track change"
+        assert seen and seen[-1] is None, "lyrics_changed(None) not emitted"
+        # Manual search clears too.
+        engine.lyrics = demo_result
+        engine.search_manual("Coldplay", "Clocks")
+        assert engine.lyrics is None, "old lyrics not cleared on manual search"
+        # Re-fetch clears too (cached lyrics are known wrong).
+        engine.lyrics = demo_result
+        engine.track = track
+        engine.refetch_lyrics()
+        assert engine.lyrics is None, "old lyrics not cleared on re-fetch"
+    finally:
+        engine.stop()
+    print("  engine clears lyrics on new track: OK (track change / manual / re-fetch)")
+
+
 def test_demo_word_highlight(app):
     """End to end (headless, --demo data): the Full App's current list
     item and the Overlay's current label carry word HTML, not plain
@@ -724,6 +833,9 @@ def main():
     test_glow_word_label(app)
     test_choose_lyrics_dialog(app)
     test_engine_refetch_ignores_cache(app)
+    test_preferences_dialog(app)
+    test_engine_lyrics_prefs(app)
+    test_engine_clears_lyrics_on_new_track(app)
     test_lyrics_debug_text(app)
     test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()

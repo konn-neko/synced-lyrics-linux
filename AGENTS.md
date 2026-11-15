@@ -16,11 +16,11 @@ no login, no API keys.
 
 | File | Does what |
 |---|---|
-| `synced_lyrics.py` | Entry point + all UI: `FullAppWindow`, `OverlayWindow` (+ `ClickThroughHandle`), `AppController`, tray, display picker, CLI (`--mode`, `--screen`, `--demo`, `--test-lyrics`). |
+| `synced_lyrics.py` | Entry point + all UI: `FullAppWindow`, `OverlayWindow` (+ `ClickThroughHandle`), `AppController`, tray, display picker, `PreferencesDialog` (File > Preferences…, Ctrl+,), CLI (`--mode`, `--screen`, `--demo`, `--test-lyrics`). |
 | `koneko_lyrics.py` | 3-line shim: imports `main` from `synced_lyrics.py`. Kept so the old `python3 koneko_lyrics.py` command still works. |
-| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, `MonotonicPosition` interpolated position (never goes backwards — see MPRIS), lyrics fetch in a worker thread (Better Lyrics TTML first, then Unison, AMLL, QQ, NetEase, LRCLIB, Kugou). Both windows + tray render from it; never create a second poller. `word_index_at(pos)` gives the (line, word) active at a position. |
+| `playback.py` | `PlaybackEngine` — the ONE shared state object. Single 250 ms MPRIS poller, `MonotonicPosition` interpolated position (never goes backwards — see MPRIS), lyrics fetch in a worker thread via `lyrics.fetch_lyrics` (provider order/enabled/word-only come from `engine.set_lyrics_prefs`). Both windows + tray render from it; never create a second poller. `word_index_at(pos)` gives the (line, word) active at a position. A new track clears the displayed lyrics AT ONCE in `_fetch_lyrics` (and manual search / re-fetch clear too) — the old song's lines must never linger while the new lookup runs. |
 | `mpris.py` | MPRIS client. Primary: `PySide6.QtDBus`. Fallback: `playerctl` CLI. `list_players()`, `get_track()`, `play_pause()`, `next_track()`, `previous_track()`, `seek()`. `TrackInfo` dataclass. |
-| `lyrics.py` | TTML + LRC + QRC + yrc parsers and seven lyrics clients. `parse_ttml()`, `parse_lrc()` (incl. Enhanced-LRC word tags), `parse_qrc()` (QRC + NetEase yrc), `fetch_betterlyrics()`, `fetch_unison()`, `fetch_amll()`, `fetch_qq()`, `fetch_netease()`, `fetch_lrclib()`, `fetch_kugou()`, `search_all_candidates()`, `LyricsResult`, `LyricLine`, `LyricWord`, `LRCLIBRateLimited`, `demo_result()` (demo lines get proportional word timings so `--demo` shows word highlight). |
+| `lyrics.py` | TTML + LRC + QRC + yrc parsers and seven lyrics clients. `PROVIDERS` registry (key, label, blurb) + `DEFAULT_PROVIDER_ORDER` + `normalise_provider_prefs()` — the order is user-editable in Preferences, so never hardcode the chain anywhere else. `fetch_lyrics()` is the ONE auto-fetch chain (order/enabled/word_only params). `parse_ttml()`, `parse_lrc()` (incl. Enhanced-LRC word tags), `parse_qrc()` (QRC + NetEase yrc), `fetch_betterlyrics()`, `fetch_unison()`, `fetch_amll()`, `fetch_qq()`, `fetch_netease()`, `fetch_lrclib()`, `fetch_kugou()`, `search_all_candidates()` (same prefs params), `LyricsResult`, `LyricLine`, `LyricWord`, `LRCLIBRateLimited`, `demo_result()` (demo lines get proportional word timings so `--demo` shows word highlight). |
 | `test_lyrics.py` | Tests for `lyrics.py` only (no Qt needed). Runnable as `python3 test_lyrics.py` or `pytest`. |
 | `install.sh` | CachyOS/Arch one-command install: pacman `pyside6` + `playerctl`, launcher `~/.local/bin/synced-lyrics`, desktop file `~/.local/share/applications/synced-lyrics-linux.desktop`. |
 | `requirements.txt` | `PySide6>=6.6` — pip fallback only; prefer the distro package. |
@@ -309,7 +309,39 @@ no login, no API keys.
   `AppController.show_lyrics_debug`) shows `build_lyrics_debug_text`
   (track, source, raw file, request log) in a monospace read-only
   view with Copy all. Never commit cached lyrics or raw TTML.
-- Single instance: `main()` takes a `QLockFile` at
+- Preferences: **File > Preferences…** (Ctrl+,; also in the overlay
+  right-click menu and the tray menu) opens `PreferencesDialog`
+  (synced_lyrics.py). It works on a copy of the cfg — Cancel discards
+  everything, OK hands `new_cfg` to `AppController.apply_preferences`,
+  which saves and refreshes every window + the engine. Sections:
+  **Lyrics sources** — the seven providers as a checkable list with
+  Move up / Move down / Restore defaults; order is the auto-fetch
+  order (top first), unchecked providers are skipped by auto-fetch
+  AND the picker. **Sync** — `word_only` checkbox ("Only use
+  word-synced lyrics": line-only results are skipped in the chain and
+  hidden from the picker; a track with only line sync shows "No
+  word-synced lyrics found") + sync offset spinbox. **Appearance** —
+  font size, line animations toggle, "Open at launch" (Full App /
+  Overlay, config `start_mode`; `--mode` still wins). **Overlay** —
+  opacity slider, click-through. **Behaviour** — minimise to tray,
+  display picker. **Lyrics cache** — track count + size readout and
+  a Clear button (deletes `*.json` in the cache dir, keeps art).
+  Applying prefs re-fetches the current track via
+  `engine.set_lyrics_prefs` (the displayed lyrics may have come from
+  a provider that is now off, or be line-only under a new word-only
+  rule). Config keys: `provider_order`, `provider_enabled`,
+  `word_only`, `start_mode`. `normalise_provider_prefs` (lyrics.py)
+  cleans a stale config: unknown keys dropped, missing providers
+  appended at the end (on) — so a new provider added by an update is
+  never silently absent. The no-match status names the enabled count:
+  "No lyrics found (N providers checked)".
+- New track clears lyrics immediately: `_fetch_lyrics` sets
+  `self.lyrics = None` + `lyrics_changed.emit(None)` before the
+  worker fetch starts, so the previous song's lines never linger
+  while the new lookup runs (seven providers, network round-trips).
+  Same on manual search and on re-fetch (cached lyrics there are
+  known wrong). The stale-result guard (`key != _fetch_key`) still
+  drops late results for a track already left.
   `~/.config/synced-lyrics-linux/synced-lyrics.lock` (held on the app
   object for the run; `tryLock(0)` — PySide6 requires the timeout arg;
   stale locks from crashed runs are reclaimed by Qt). A second launch
@@ -337,7 +369,8 @@ no login, no API keys.
 
 - Config: `~/.config/synced-lyrics-linux/config.json`
   (offset, font_size, display, minimise_to_tray, overlay_opacity,
-  overlay_click_through, line_animations, last_player).
+  overlay_click_through, line_animations, last_player,
+  provider_order, provider_enabled, word_only, start_mode).
 - Lyrics cache: `~/.cache/synced-lyrics-linux/*.json` — LRCLIB records
   as `<sha256>.json`, Better Lyrics TTML as `bl-<sha256>.json`,
   Unison as `un-<sha256>.json`, AMLL as `am-<sha256>.json`, QQ QRC as
@@ -371,11 +404,14 @@ offscreen has one virtual display, so `--screen 1` falls back to primary.
 
 1. Add a `fetch_<provider>()` in `lyrics.py` returning `LyricsResult`
    (or `None`), same shape as `fetch_betterlyrics()` / `fetch_lrclib()`.
-2. Call it from `playback.py: _LyricsWorker.fetch` in the chain
-   (Better Lyrics TTML first, then Unison, AMLL, QQ, NetEase, LRCLIB,
-   Kugou — word-sync sources before line-only ones; keep that order
-   unless the new provider has word sync and a keyless cache-first model).
-   A provider that returns None on 401/429 must never fail the track.
+2. Register it in `lyrics.py: PROVIDERS` (key, label, blurb) and in
+   `_fetcher_map()` — the chain lives in `fetch_lyrics()` and the
+   picker in `search_all_candidates()`; both read the registry order,
+   and the user can reorder/disable the provider in Preferences, so
+   never hardcode the chain in `playback.py` (the worker only passes
+   the engine's prefs through). Word-sync sources go before line-only
+   ones in `DEFAULT_PROVIDER_ORDER`. A provider that returns None on
+   401/429 must never fail the track.
 3. Set `result.source` to the provider name so the status bar is honest.
 4. Add a parser test in `test_lyrics.py` if the format differs from LRC.
 5. Document the provider, its rate limits, and whether it needs a key

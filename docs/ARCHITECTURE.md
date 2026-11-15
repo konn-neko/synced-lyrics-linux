@@ -20,7 +20,8 @@ Repo: https://github.com/konn-neko/synced-lyrics-linux
 │  • QTimer, 250 ms: get_track(player) via mpris.py        │
 │  • Position interpolated with time.monotonic() between   │
 │    polls (browsers report position in 1 s steps)         │
-│  • Track change → fetch lyrics in a QThread worker       │
+│  • Track change → clear displayed lyrics at once, then   │
+│    fetch lyrics in a QThread worker                      │
 │  • Sync offset added at lookup time, not to the position │
 │  • Signals: track_changed / lyrics_changed /             │
 │    position_changed / players_changed / status_changed   │
@@ -33,7 +34,11 @@ Repo: https://github.com/konn-neko/synced-lyrics-linux
 │  playerctl   │      │  Unison, AMLL TTML (word),   │
 │  fallback    │      │  QQ QRC (word), NetEase yrc  │
 │              │      │  (word), LRCLIB, Kugou —     │
-│              │      │  in that order; cache in     │
+│              │      │  default order; user can     │
+│              │      │  reorder / disable / require │
+│              │      │  word sync in Preferences    │
+│              │      │  (File > Preferences…,       │
+│              │      │  Ctrl+,); cache in           │
 │              │      │  ~/.cache/…                  │
 └──────────────┘      └──────────────────────────────┘
        │

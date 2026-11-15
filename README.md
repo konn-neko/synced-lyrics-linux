@@ -88,6 +88,15 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   chosen display immediately; the Full App moves via
   `View > Move Full App to selected display`. A saved display that has
   disappeared falls back to primary.
+- **Preferences** — `File > Preferences…` (Ctrl+,), also in the Overlay
+  and tray menus. Lyrics sources: enable/disable each of the seven
+  providers and drag them into your preferred order (tried top first).
+  Sync: "Only use word-synced lyrics" skips line-only results entirely,
+  and the sync offset is a spinbox here too. Appearance: font size,
+  smooth line animations, which window opens at launch. Overlay:
+  opacity and click-through. Behaviour: minimise to tray, display.
+  Plus a lyrics-cache size readout and a Clear cache button. Changing
+  the sources re-fetches the current track immediately.
 - **Any MPRIS player** — Spotify desktop, YouTube Music in Firefox /
   Chromium, VLC, Elisa… discovered automatically, no player names
   hardcoded. Player selector dropdown when several are playing.
@@ -308,8 +317,16 @@ service. Lyrics are fetched at runtime and never shipped with the repo.
 `~/.config/synced-lyrics-linux/config.json` — sync offset, font size,
 display choice, minimise-to-tray, overlay opacity / click-through,
 `line_animations` (smooth scroll + crossfades on line change, default
-`true`; set `false` for the instant old-style swap), last player. Edit
-it while the app is closed, or use the in-app controls.
+`true`; set `false` for the instant old-style swap), last player,
+`provider_order` / `provider_enabled` (which lyrics sources to try,
+in which order), `word_only` (only word-synced lyrics, skip line-only
+results), `start_mode` (`full` or `overlay` — which window opens at
+launch). Edit it while the app is closed, or use File > Preferences…
+
+When a new song is detected, the displayed lyrics are cleared at once
+— the previous track's lines never linger while the new lookup runs.
+The same happens on a manual search and on Re-fetch (the cached lyrics
+there are known wrong).
 
 Lyrics cache: `~/.cache/synced-lyrics-linux/` (JSON, one file per track).
 Album art cache: `~/.cache/synced-lyrics-linux/art/`. Both are gitignored

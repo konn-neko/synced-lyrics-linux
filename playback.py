@@ -18,18 +18,14 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 import mpris
 from lyrics import (
+    DEFAULT_PROVIDER_ORDER,
     LRCLIBRateLimited,
     LyricsResult,
     cache_lrclib_record,
     clear_track_cache,
     demo_result,
-    fetch_amll,
-    fetch_betterlyrics,
-    fetch_kugou,
-    fetch_lrclib,
-    fetch_netease,
-    fetch_qq,
-    fetch_unison,
+    fetch_lyrics,
+    normalise_provider_prefs,
     search_all_candidates,
 )
 
@@ -86,6 +82,13 @@ class _LyricsWorker(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Lyrics preferences, set by the engine (which gets them from
+        # the app config / Preferences dialog). The worker reads them
+        # when a queued fetch/search slot runs, so a prefs change
+        # applies to the next lookup without restarting anything.
+        # (order, enabled dict, word_only) — defaults: registry
+        # order, everything on, word sync preferred but not required.
+        self.lyrics_prefs = (list(DEFAULT_PROVIDER_ORDER), {}, False)
         self.fetch_requested.connect(self.fetch)
         self.search_requested.connect(self.search)
 
@@ -95,31 +98,10 @@ class _LyricsWorker(QObject):
                 # The cached lyrics were wrong: drop them first so a
                 # failed re-pull can't leave the wrong ones in place.
                 clear_track_cache(artist, track, album, duration)
-            # Provider order: Better Lyrics TTML (word sync) first,
-            # then Unison, AMLL (hand-timed TTML), QQ QRC (word sync),
-            # NetEase (yrc word sync when present), LRCLIB, then
-            # Kugou (line sync). A provider returning None just falls
-            # through to the next — the track never fails for one.
-            result = fetch_betterlyrics(artist, track, album, duration,
-                                        use_cache=not force)
-            if result is None:
-                result = fetch_unison(artist, track, album, duration,
-                                      use_cache=not force)
-            if result is None:
-                result = fetch_amll(artist, track, album, duration,
-                                    use_cache=not force)
-            if result is None:
-                result = fetch_qq(artist, track, album, duration,
-                                  use_cache=not force)
-            if result is None:
-                result = fetch_netease(artist, track, album, duration,
-                                       use_cache=not force)
-            if result is None:
-                result = fetch_lrclib(artist, track, album, duration,
-                                      use_cache=not force)
-            if result is None:
-                result = fetch_kugou(artist, track, album, duration,
-                                     use_cache=not force)
+            order, enabled, word_only = self.lyrics_prefs
+            result = fetch_lyrics(artist, track, album, duration,
+                                  order=order, enabled=enabled,
+                                  word_only=word_only, use_cache=not force)
             self.result_ready.emit((key, result))
         except LRCLIBRateLimited as e:
             self.result_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -129,7 +111,10 @@ class _LyricsWorker(QObject):
     def search(self, artist, track, album, duration, key):
         """All lyric candidates for the picker (all providers)."""
         try:
-            results = search_all_candidates(artist, track, album, duration)
+            order, enabled, word_only = self.lyrics_prefs
+            results = search_all_candidates(artist, track, album, duration,
+                                            order=order, enabled=enabled,
+                                            word_only=word_only)
             self.search_ready.emit((key, results))
         except LRCLIBRateLimited as e:
             self.search_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -163,6 +148,12 @@ class PlaybackEngine(QObject):
         self._fetch_key: tuple | None = None
         self._search_key: tuple | None = None
         self._players: list[str] = []
+        # Lyrics preferences (provider order / enabled / word-only),
+        # from the app config via set_lyrics_prefs. Defaults match
+        # the registry until the controller hands over the real ones.
+        self.provider_order = list(DEFAULT_PROVIDER_ORDER)
+        self.provider_enabled = {k: True for k in DEFAULT_PROVIDER_ORDER}
+        self.word_only = False
 
         self._worker_thread = QThread(self)
         self._worker = _LyricsWorker()
@@ -207,6 +198,22 @@ class PlaybackEngine(QObject):
     def set_offset(self, seconds: float):
         self.offset = seconds
         self._emit_position()
+
+    def set_lyrics_prefs(self, order, enabled, word_only: bool):
+        """Apply the lyrics preferences (from the Preferences dialog).
+
+        Normalised here so a stale config can never leave a provider
+        out of the chain. Re-fetches the current track: the displayed
+        lyrics may have come from a provider that is now off, or may
+        be line-only under a new word-only rule.
+        """
+        order, enabled = normalise_provider_prefs(order, enabled)
+        self.provider_order = order
+        self.provider_enabled = enabled
+        self.word_only = bool(word_only)
+        self._worker.lyrics_prefs = (order, enabled, bool(word_only))
+        if self.track.title and self.track.artist and not self.demo:
+            self._fetch_lyrics(self.track)
 
     # -------------------------------------------------------------- polling
     def _refresh_players(self):
@@ -294,6 +301,12 @@ class PlaybackEngine(QObject):
             self.lyrics_changed.emit(None)
             self.status_changed.emit("No track metadata — cannot look up lyrics")
             return
+        # Clear the previous track's lyrics NOW, not when the fetch
+        # lands: the old lines would stay on screen for seconds
+        # otherwise (seven providers, network round-trips) while the
+        # new song is already playing.
+        self.lyrics = None
+        self.lyrics_changed.emit(None)
         self._fetch_key = track.key
         self.status_changed.emit(f"Looking up lyrics for {track.display} …")
         # Run the network fetch on the worker thread (queued signal).
@@ -311,7 +324,14 @@ class PlaybackEngine(QObject):
         self.lyrics = result
         self.lyrics_changed.emit(result)
         if result is None:
-            self.status_changed.emit("No lyrics found (7 providers checked) for this track")
+            n = sum(1 for v in self.provider_enabled.values() if v)
+            if self.word_only:
+                self.status_changed.emit(
+                    f"No word-synced lyrics found for this track "
+                    f"({n} provider{'s' if n != 1 else ''} checked, "
+                    f"line-only results skipped by Preferences)")
+            else:
+                self.status_changed.emit(f"No lyrics found ({n} providers checked) for this track")
         elif result.instrumental:
             self.status_changed.emit("Instrumental — no lyrics (LRCLIB)")
         elif result.has_synced:
@@ -336,7 +356,8 @@ class PlaybackEngine(QObject):
         elif result.plain_lyrics:
             self.status_changed.emit("Plain lyrics only — no sync data")
         else:
-            self.status_changed.emit("No lyrics found (7 providers checked) for this track")
+            n = sum(1 for v in self.provider_enabled.values() if v)
+            self.status_changed.emit(f"No lyrics found ({n} providers checked) for this track")
         self._emit_position()
 
     def current_position(self) -> float:
@@ -369,6 +390,10 @@ class PlaybackEngine(QObject):
         """Manual lookup from the search box: pretends this is the track."""
         key = (artist.lower().strip(), track.lower().strip(), "", 0)
         self._fetch_key = key
+        # Same as a track change: drop the old lyrics at once, so the
+        # previous track's lines don't linger while this lookup runs.
+        self.lyrics = None
+        self.lyrics_changed.emit(None)
         self.status_changed.emit(f"Looking up lyrics for {artist} — {track} …")
         self._worker.fetch_requested.emit(artist, track, "", 0.0, key, False)
 
@@ -403,6 +428,10 @@ class PlaybackEngine(QObject):
             self.status_changed.emit("No track metadata — nothing to re-fetch")
             return
         self._fetch_key = track.key
+        # The cached lyrics are known wrong — clear them at once rather
+        # than showing them while the fresh pull runs.
+        self.lyrics = None
+        self.lyrics_changed.emit(None)
         self.status_changed.emit(
             f"Re-fetching lyrics for {track.display} (ignoring cache) …")
         self._worker.fetch_requested.emit(

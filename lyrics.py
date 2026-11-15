@@ -52,6 +52,42 @@ UNISON_BASE = "https://unison.betterlyrics.org"
 AMLL_BASE = "https://api.amll.dev"
 NETEASE_BASE = "https://music.163.com"
 CLIENT_HEADER = "synced-lyrics-linux/1.0"
+
+# The provider registry. Key is the stable id used in config
+# ("provider_order" / "provider_enabled") and in LyricsResult.source
+# prefixes; label + blurb are what the Preferences dialog shows.
+# Order here is the DEFAULT auto-fetch order (word-sync sources
+# first, line-only last) — the user can reorder it in Preferences.
+PROVIDERS = [
+    ("betterlyrics", "Better Lyrics", "TTML, syllable sync (cache-first)"),
+    ("unison", "Unison", "Community uploads, TTML/LRC"),
+    ("amll", "AMLL", "Hand-timed TTML, small corpus"),
+    ("qq", "QQ Music", "QRC, word sync"),
+    ("netease", "NetEase", "yrc word sync / LRC"),
+    ("lrclib", "LRCLIB", "LRC, line sync"),
+    ("kugou", "Kugou", "LRC, line sync"),
+]
+DEFAULT_PROVIDER_ORDER = [key for key, _label, _blurb in PROVIDERS]
+
+
+def normalise_provider_prefs(order, enabled):
+    """Clean a (provider_order, provider_enabled) pair from config.
+
+    Drops unknown keys, appends any known provider missing from the
+    order (at the end, in default order — so a new provider added by
+    an update is on, not silently absent), and defaults every
+    provider to enabled unless the config says otherwise.
+    Returns (order, enabled) with enabled as a full dict.
+    """
+    known = set(DEFAULT_PROVIDER_ORDER)
+    clean_order = [k for k in (order or []) if k in known]
+    for k in DEFAULT_PROVIDER_ORDER:
+        if k not in clean_order:
+            clean_order.append(k)
+    clean_enabled = {}
+    for k in DEFAULT_PROVIDER_ORDER:
+        clean_enabled[k] = bool((enabled or {}).get(k, True))
+    return clean_order, clean_enabled
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "synced-lyrics-linux"
 
 _TAG_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
@@ -1083,50 +1119,112 @@ def fetch_netease(
     return result
 
 
+# The auto-fetch chain, as one function so the order is defined in
+# exactly one place (worker, tests, picker all go through it).
+# Built lazily: fetch_betterlyrics / fetch_lrclib are defined below
+# this block, so a module-level dict would NameError at import.
+def _fetcher_map() -> dict:
+    return {
+        "betterlyrics": fetch_betterlyrics,
+        "unison": fetch_unison,
+        "amll": fetch_amll,
+        "qq": fetch_qq,
+        "netease": fetch_netease,
+        "lrclib": fetch_lrclib,
+        "kugou": fetch_kugou,
+    }
+
+
+def fetch_lyrics(
+    artist: str,
+    track: str,
+    album: str | None = None,
+    duration: float | None = None,
+    order: list | None = None,
+    enabled: dict | None = None,
+    word_only: bool = False,
+    use_cache: bool = True,
+    cache_dir: Path | None = None,
+) -> LyricsResult | None:
+    """First matching lyrics, trying providers in `order`.
+
+    Defaults to the registry order (word-sync sources first, line-only
+    last). Disabled providers are skipped. With `word_only`, a
+    line-only result is skipped and the chain continues — the caller
+    gets word-synced lyrics or None, never a line-only fallback. A
+    provider returning None just falls through to the next; the track
+    never fails for one provider.
+    """
+    order, enabled = normalise_provider_prefs(order, enabled)
+    fetchers = _fetcher_map()
+    for key in order:
+        if not enabled.get(key, True):
+            continue
+        fn = fetchers[key]
+        try:
+            result = fn(artist, track, album, duration,
+                        cache_dir=cache_dir, use_cache=use_cache)
+        except Exception:
+            result = None
+        if result is None:
+            continue
+        if word_only and not result.has_word_sync:
+            continue
+        if result.has_synced or result.plain_lyrics or result.instrumental:
+            return result
+    return None
+
+
 def search_all_candidates(
     artist: str,
     track: str,
     album: str | None = None,
     duration: float | None = None,
+    order: list | None = None,
+    enabled: dict | None = None,
+    word_only: bool = False,
 ) -> list[LyricsResult]:
     """All lyric candidates for the picker, word-synced first.
 
-    Better Lyrics TTML (single best match) + Unison + AMLL + QQ QRC
-    (word-level) + NetEase + Kugou LRC + LRCLIB search results. Each
-    provider is best-effort: one returning None just contributes
-    nothing. Sorted: word-synced first (TTML, then Unison, AMLL, QQ,
-    word-tagged LRCLIB), then synced, then plain-only — uncensored
+    Every provider in `order` (except LRCLIB, which contributes its
+    search results) + LRCLIB search results. Each provider is
+    best-effort: one returning None just contributes nothing. Sorted:
+    word-synced first, then synced, then plain-only — uncensored
     above censored within each rank, provider order within that.
+    With `word_only`, line-only results are left out entirely.
     """
+    order, enabled = normalise_provider_prefs(order, enabled)
+    fetchers = _fetcher_map()
     candidates: list[LyricsResult] = []
-    for fn in (fetch_betterlyrics, fetch_unison, fetch_amll, fetch_qq,
-               fetch_netease, fetch_kugou):
+    for key in order:
+        if key == "lrclib" or not enabled.get(key, True):
+            continue
         try:
-            result = fn(artist, track, album, duration)
+            result = fetchers[key](artist, track, album, duration)
         except Exception:
             result = None
         if result is not None and (result.has_synced or result.plain_lyrics
                                    or result.instrumental):
+            if word_only and not result.has_word_sync:
+                continue
             candidates.append(result)
-    try:
-        candidates.extend(search_lrclib(artist, track, album, duration))
-    except Exception:
-        pass
+    if enabled.get("lrclib", True):
+        try:
+            for result in search_lrclib(artist, track, album, duration):
+                if word_only and not result.has_word_sync:
+                    continue
+                candidates.append(result)
+        except Exception:
+            pass
 
     def _provider_rank(r: LyricsResult) -> int:
-        if r.source.startswith("betterlyrics"):
-            return 0
-        if r.source.startswith("unison"):
-            return 1
-        if r.source.startswith("amll"):
-            return 2
-        if r.source.startswith("qq"):
-            return 3
-        if r.source.startswith("netease"):
-            return 4
-        if r.source == "search":
-            return 5
-        return 6
+        for i, key in enumerate(order):
+            if key == "lrclib":
+                if r.source == "search" or r.source.startswith("lrclib"):
+                    return i
+            elif r.source.startswith(key):
+                return i
+        return len(order)
 
     def _rank(r: LyricsResult):
         sync = 0 if r.has_word_sync else (1 if r.has_synced else 2)

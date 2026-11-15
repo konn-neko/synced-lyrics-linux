@@ -36,15 +36,19 @@ from PySide6.QtGui import (
     QTextDocument, QTextOption,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
-    QGraphicsOpacityEffect, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSizeGrip,
-    QSlider, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QGraphicsOpacityEffect,
+    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QSizeGrip, QSlider,
+    QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 import mpris
-from lyrics import fetch_lrclib, log_request, request_log_text
+from lyrics import (
+    DEFAULT_CACHE_DIR, DEFAULT_PROVIDER_ORDER, PROVIDERS,
+    fetch_lrclib, log_request, normalise_provider_prefs, request_log_text,
+)
 from playback import PlaybackEngine
 
 APP_NAME = "synced-lyrics-linux"
@@ -77,6 +81,13 @@ DEFAULT_CONFIG = {
     "overlay_click_through": False,
     "line_animations": True,  # smooth scroll + crossfade; False = instant swap
     "last_player": "",
+    # Lyrics sources (Preferences): tried in this order, top first.
+    "provider_order": list(DEFAULT_PROVIDER_ORDER),
+    "provider_enabled": {k: True for k in DEFAULT_PROVIDER_ORDER},
+    # Only accept word-synced lyrics; skip line-only results entirely.
+    "word_only": False,
+    # Which window to open at launch ("full" | "overlay"); --mode wins.
+    "start_mode": "full",
 }
 
 
@@ -950,6 +961,255 @@ class ChooseLyricsDialog(QDialog):
         self.accept()
 
 
+class PreferencesDialog(QDialog):
+    """Preferences: lyrics sources, sync, appearance, overlay, behaviour.
+
+    Works on a copy of the controller's cfg; on accept the result is
+    in `self.new_cfg` for the controller to apply + save. Cancel
+    discards everything — nothing is written until OK.
+    """
+
+    def __init__(self, parent, cfg: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences — synced-lyrics-linux")
+        self.setMinimumSize(580, 600)
+        self.cfg = dict(cfg)
+        order, enabled = normalise_provider_prefs(
+            self.cfg.get("provider_order"), self.cfg.get("provider_enabled"))
+        self.cfg["provider_order"] = order
+        self.cfg["provider_enabled"] = enabled
+        self.new_cfg: dict | None = None
+
+        layout = QVBoxLayout(self)
+
+        # --- Lyrics sources: order + on/off -------------------------
+        src_group = QGroupBox("Lyrics sources")
+        src_layout = QVBoxLayout(src_group)
+        src_layout.addWidget(QLabel(
+            "Tried in order, top first. Unchecked providers are skipped "
+            "entirely — for auto-fetch and for Choose lyrics."))
+        row = QHBoxLayout()
+        self.provider_list = QListWidget(self)
+        self.provider_list.setMinimumHeight(180)
+        for key, label, blurb in PROVIDERS:
+            item = QListWidgetItem(f"{label} — {blurb}")
+            item.setData(Qt.UserRole, key)
+            item.setCheckState(Qt.Checked if enabled.get(key, True)
+                               else Qt.Unchecked)
+            self.provider_list.addItem(item)
+        self.provider_list.setCurrentRow(0)
+        row.addWidget(self.provider_list, stretch=1)
+        btns = QVBoxLayout()
+        self.up_btn = QPushButton("Move up")
+        self.up_btn.clicked.connect(lambda: self._move_provider(-1))
+        btns.addWidget(self.up_btn)
+        self.down_btn = QPushButton("Move down")
+        self.down_btn.clicked.connect(lambda: self._move_provider(1))
+        btns.addWidget(self.down_btn)
+        btns.addStretch(1)
+        self.defaults_btn = QPushButton("Restore defaults")
+        self.defaults_btn.clicked.connect(self._restore_provider_defaults)
+        btns.addWidget(self.defaults_btn)
+        row.addLayout(btns)
+        src_layout.addLayout(row)
+        layout.addWidget(src_group)
+
+        # --- Sync ----------------------------------------------------
+        sync_group = QGroupBox("Sync")
+        sync_layout = QVBoxLayout(sync_group)
+        self.word_only_box = QCheckBox(
+            "Only use word-synced lyrics (skip line-only results)")
+        self.word_only_box.setChecked(bool(self.cfg.get("word_only", False)))
+        self.word_only_box.setToolTip(
+            "When on, a track with only line-synced lyrics shows "
+            "\"No word-synced lyrics found\" instead of the line sync.")
+        sync_layout.addWidget(self.word_only_box)
+        off_row = QHBoxLayout()
+        off_row.addWidget(QLabel("Sync offset:"))
+        self.offset_spin = QDoubleSpinBox(self)
+        self.offset_spin.setRange(-5.0, 5.0)
+        self.offset_spin.setSingleStep(0.5)
+        self.offset_spin.setSuffix(" s")
+        self.offset_spin.setValue(float(self.cfg.get("offset", 0.0)))
+        off_row.addWidget(self.offset_spin)
+        off_row.addWidget(QLabel("Shift lyrics earlier (−) or later (+)"))
+        off_row.addStretch(1)
+        sync_layout.addLayout(off_row)
+        layout.addWidget(sync_group)
+
+        # --- Appearance ----------------------------------------------
+        app_group = QGroupBox("Appearance")
+        app_layout = QVBoxLayout(app_group)
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Lyrics font size:"))
+        self.font_spin = QSpinBox(self)
+        self.font_spin.setRange(10, 32)
+        self.font_spin.setSuffix(" px")
+        self.font_spin.setValue(int(self.cfg.get("font_size", 16)))
+        font_row.addWidget(self.font_spin)
+        font_row.addStretch(1)
+        app_layout.addLayout(font_row)
+        self.anim_box = QCheckBox("Smooth line animations (glide + crossfade)")
+        self.anim_box.setChecked(bool(self.cfg.get("line_animations", True)))
+        app_layout.addWidget(self.anim_box)
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Open at launch:"))
+        self.start_combo = QComboBox(self)
+        self.start_combo.addItem("Full App", "full")
+        self.start_combo.addItem("Overlay", "overlay")
+        start_mode = str(self.cfg.get("start_mode", "full"))
+        self.start_combo.setCurrentIndex(1 if start_mode == "overlay" else 0)
+        start_row.addWidget(self.start_combo)
+        start_row.addStretch(1)
+        app_layout.addLayout(start_row)
+        layout.addWidget(app_group)
+
+        # --- Overlay ---------------------------------------------------
+        ov_group = QGroupBox("Overlay")
+        ov_layout = QVBoxLayout(ov_group)
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Opacity:"))
+        self.opacity_slider = QSlider(Qt.Horizontal, self)
+        self.opacity_slider.setRange(30, 100)
+        self.opacity_slider.setValue(
+            int(float(self.cfg.get("overlay_opacity", 0.85)) * 100))
+        self.opacity_label = QLabel()
+        self.opacity_slider.valueChanged.connect(self._refresh_opacity_label)
+        self._refresh_opacity_label()
+        op_row.addWidget(self.opacity_slider, stretch=1)
+        op_row.addWidget(self.opacity_label)
+        ov_layout.addLayout(op_row)
+        self.click_through_box = QCheckBox(
+            "Click-through (clicks pass through the overlay)")
+        self.click_through_box.setChecked(
+            bool(self.cfg.get("overlay_click_through", False)))
+        ov_layout.addWidget(self.click_through_box)
+        layout.addWidget(ov_group)
+
+        # --- Behaviour ---------------------------------------------------
+        beh_group = QGroupBox("Behaviour")
+        beh_layout = QVBoxLayout(beh_group)
+        self.min_tray_box = QCheckBox("Minimise to tray on close")
+        self.min_tray_box.setChecked(bool(self.cfg.get("minimise_to_tray", True)))
+        beh_layout.addWidget(self.min_tray_box)
+        disp_row = QHBoxLayout()
+        disp_row.addWidget(QLabel("Display:"))
+        self.display_combo = QComboBox(self)
+        self._fill_display_combo()
+        disp_row.addWidget(self.display_combo)
+        disp_row.addStretch(1)
+        beh_layout.addLayout(disp_row)
+        layout.addWidget(beh_group)
+
+        # --- Lyrics cache ------------------------------------------------
+        cache_group = QGroupBox("Lyrics cache")
+        cache_layout = QVBoxLayout(cache_group)
+        self.cache_label = QLabel()
+        cache_layout.addWidget(self.cache_label)
+        self._refresh_cache_label()
+        clear_btn = QPushButton("Clear lyrics cache")
+        clear_btn.setToolTip("Delete all cached lyrics (album art is kept)")
+        clear_btn.clicked.connect(self._clear_cache)
+        cache_layout.addWidget(clear_btn)
+        layout.addWidget(cache_group)
+
+        layout.addStretch(1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_opacity_label(self):
+        self.opacity_label.setText(f"{self.opacity_slider.value()}%")
+
+    def _fill_display_combo(self):
+        screens = QGuiApplication.screens()
+        self.display_combo.addItem("Primary display", "primary")
+        self.display_combo.addItem("Follow the mouse", "follow")
+        for i, scr in enumerate(screens):
+            geo = scr.geometry()
+            primary = " (primary)" if scr == QGuiApplication.primaryScreen() else ""
+            self.display_combo.addItem(
+                f"Display {i} — {geo.width()}×{geo.height()}{primary}", i)
+        current = self.cfg.get("display", "primary")
+        idx = self.display_combo.findData(current)
+        self.display_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _move_provider(self, delta: int):
+        row = self.provider_list.currentRow()
+        new_row = row + delta
+        if row < 0 or new_row < 0 or new_row >= self.provider_list.count():
+            return
+        item = self.provider_list.takeItem(row)
+        self.provider_list.insertItem(new_row, item)
+        self.provider_list.setCurrentRow(new_row)
+
+    def _restore_provider_defaults(self):
+        self.provider_list.clear()
+        for key, label, blurb in PROVIDERS:
+            item = QListWidgetItem(f"{label} — {blurb}")
+            item.setData(Qt.UserRole, key)
+            item.setCheckState(Qt.Checked)
+            self.provider_list.addItem(item)
+        self.provider_list.setCurrentRow(0)
+
+    def _cache_files(self) -> list:
+        try:
+            return [p for p in DEFAULT_CACHE_DIR.glob("*.json") if p.is_file()]
+        except Exception:
+            return []
+
+    def _refresh_cache_label(self):
+        files = self._cache_files()
+        total = sum(p.stat().st_size for p in files)
+        if total >= 1024 * 1024:
+            size = f"{total / (1024 * 1024):.1f} MB"
+        elif total >= 1024:
+            size = f"{total / 1024:.0f} KB"
+        else:
+            size = f"{total} B"
+        self.cache_label.setText(
+            f"{len(files)} cached track(s), {size} — "
+            f"stored in {DEFAULT_CACHE_DIR}")
+
+    def _clear_cache(self):
+        removed = 0
+        for p in self._cache_files():
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+        self._refresh_cache_label()
+        self.cache_label.setText(
+            f"Cleared {removed} cached track(s).")
+
+    def accept(self):
+        order = []
+        enabled = {}
+        for i in range(self.provider_list.count()):
+            item = self.provider_list.item(i)
+            key = item.data(Qt.UserRole)
+            order.append(key)
+            enabled[key] = item.checkState() == Qt.Checked
+        order, enabled = normalise_provider_prefs(order, enabled)
+        self.cfg["provider_order"] = order
+        self.cfg["provider_enabled"] = enabled
+        self.cfg["word_only"] = bool(self.word_only_box.isChecked())
+        self.cfg["offset"] = float(self.offset_spin.value())
+        self.cfg["font_size"] = int(self.font_spin.value())
+        self.cfg["line_animations"] = bool(self.anim_box.isChecked())
+        self.cfg["start_mode"] = self.start_combo.currentData()
+        self.cfg["overlay_opacity"] = self.opacity_slider.value() / 100.0
+        self.cfg["overlay_click_through"] = bool(
+            self.click_through_box.isChecked())
+        self.cfg["minimise_to_tray"] = bool(self.min_tray_box.isChecked())
+        self.cfg["display"] = self.display_combo.currentData()
+        self.new_cfg = self.cfg
+        super().accept()
+
+
 class FullAppWindow(QMainWindow):
     def __init__(self, controller):
         super().__init__()
@@ -1140,6 +1400,10 @@ class FullAppWindow(QMainWindow):
         self.min_tray_act.setChecked(bool(self.cfg.get("minimise_to_tray", True)))
         self.min_tray_act.triggered.connect(c.toggle_minimise_to_tray)
         file_menu.addAction(self.min_tray_act)
+        a = QAction("Preferences…  (Ctrl+,)", self)
+        a.setShortcut("Ctrl+,")
+        a.triggered.connect(c.show_preferences)
+        file_menu.addAction(a)
         a = QAction("Quit", self)
         a.triggered.connect(c.quit_app)
         file_menu.addAction(a)
@@ -1682,6 +1946,9 @@ class OverlayWindow(QWidget):
         action.setDefaultWidget(slider)
         menu.addAction(action)
         menu.addSeparator()
+        a = QAction("Preferences…", self)
+        a.triggered.connect(c.show_preferences)
+        menu.addAction(a)
         a = QAction("Lyrics debug", self)
         a.triggered.connect(c.show_lyrics_debug)
         menu.addAction(a)
@@ -1831,6 +2098,10 @@ class AppController:
         app.aboutToQuit.connect(self.engine.stop)
         app.aboutToQuit.connect(self._hide_all)
         self.engine.set_offset(float(self.cfg.get("offset", 0.0)))
+        self.engine.set_lyrics_prefs(
+            self.cfg.get("provider_order"),
+            self.cfg.get("provider_enabled"),
+            bool(self.cfg.get("word_only", False)))
         if self.cfg.get("last_player"):
             self.engine.set_player(self.cfg["last_player"])
 
@@ -1887,6 +2158,9 @@ class AppController:
         self.min_tray_act.setChecked(bool(self.cfg.get("minimise_to_tray", True)))
         self.min_tray_act.triggered.connect(self.toggle_minimise_to_tray)
         menu.addAction(self.min_tray_act)
+        a = QAction("Preferences…", self.app)
+        a.triggered.connect(self.show_preferences)
+        menu.addAction(a)
         a = QAction("Quit", self.app)
         a.triggered.connect(self.quit_app)
         menu.addAction(a)
@@ -1975,6 +2249,50 @@ class AppController:
         dlg = ChooseLyricsDialog(self.full, self.engine)
         dlg.exec()
 
+    def show_preferences(self):
+        """File > Preferences: lyrics sources, sync, appearance, overlay."""
+        dlg = PreferencesDialog(self.full, self.cfg)
+        if dlg.exec() != QDialog.Accepted or dlg.new_cfg is None:
+            return
+        self.apply_preferences(dlg.new_cfg)
+
+    def apply_preferences(self, new_cfg: dict):
+        """Apply a Preferences dialog result: save + refresh everything.
+
+        Provider prefs go to the engine (which re-fetches the current
+        track — the displayed lyrics may have come from a provider
+        that is now off, or be line-only under a new word-only rule).
+        """
+        self.cfg.update(new_cfg)
+        save_config(self.cfg)
+        self.engine.set_offset(float(self.cfg.get("offset", 0.0)))
+        self.engine.set_lyrics_prefs(
+            self.cfg.get("provider_order"),
+            self.cfg.get("provider_enabled"),
+            bool(self.cfg.get("word_only", False)))
+        self.full._apply_style()
+        self.full._refresh_offset_label()
+        idx = self.full._current_idx
+        self.full._current_idx = -2
+        if idx >= 0:
+            self.full._highlight(idx)
+        self.set_line_animations(bool(self.cfg.get("line_animations", True)))
+        self.overlay._apply_opacity()
+        self.overlay._apply_click_through()
+        act = getattr(self.full, "min_tray_act", None)
+        if act is not None:
+            act.setChecked(bool(self.cfg.get("minimise_to_tray", True)))
+        if getattr(self, "min_tray_act", None) is not None:
+            self.min_tray_act.setChecked(
+                bool(self.cfg.get("minimise_to_tray", True)))
+        # The display choice may have changed: rebuild the tray menu
+        # so its checkmark moves, and move the overlay if visible.
+        if self.tray:
+            self._build_tray()
+        if self.overlay.isVisible():
+            move_window_to_screen(
+                self.overlay, self.app, self.cfg.get("display", "primary"))
+
     def refetch_lyrics(self):
         """Lyrics > Re-fetch lyrics: re-pull, ignoring the cache."""
         self.engine.refetch_lyrics()
@@ -2013,8 +2331,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="synced-lyrics-linux",
         description="Native Linux synced lyrics (MPRIS + LRCLIB).")
-    p.add_argument("--mode", choices=["full", "overlay"], default="full",
-                   help="start in Full App or Overlay mode (default: full)")
+    p.add_argument("--mode", choices=["full", "overlay"], default=None,
+                   help="start in Full App or Overlay mode (default: Preferences > Open at launch)")
     p.add_argument("--screen", type=int, default=None, metavar="N",
                    help="launch on display N (0-based, see View > Display)")
     p.add_argument("--demo", action="store_true",
@@ -2084,7 +2402,9 @@ def main(argv=None) -> int:
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(make_tray_icon())
     app._single_instance_lock = lock  # keep the lock held for the run
-    controller = AppController(app, demo=args.demo, mode=args.mode,
+    # --mode wins; otherwise the launch window comes from Preferences.
+    mode = args.mode or load_config().get("start_mode", "full")
+    controller = AppController(app, demo=args.demo, mode=mode,
                                screen_choice=args.screen)
     # First instance also listens: a later launch asks us to raise.
     server = QLocalServer()
