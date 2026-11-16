@@ -304,19 +304,27 @@ no login, no API keys.
   `shit`); a fully-asterisked word (`****`) takes the donor word
   when the rest of the line anchors it (a line of only asterisks
   still cannot be verified — no anchor words). A donor word that
-  is itself asterisked never matches. Timings ALWAYS stay the
-  winner's own; a fixed word's syllable parts collapse to the whole
-  word. The copy is flagged `LyricsResult.decensored` with
-  `decensored_from` naming the donor provider; `raw_text` keeps the
-  original censored file (the debug view stays honest), and
-  `is_censored` checks the fixed lines instead, so a fully fixed
-  result reports uncensored and a partially fixed one still reports
-  censored. The status bar names the donor
-  (`… (de-censored from LRCLIB)`); the picker labels such a row
-  "de-censored". The picker itself is never de-censored — it shows
-  the raw candidates, uncensored first. Note: `is_censored_text`
+  is itself asterisked never matches. "The same line" is an
+  alignment (`_align_lines`, difflib over the words' cores), NOT
+  an exact match: different copies disagree on uncensored words
+  (one drops a "like", "girly" vs "girlie", "shashasha" vs
+  "chachacha"), so the donor line only needs its anchor words to
+  line up in order at the same timestamp — a censored word with no
+  donor counterpart (the donor drops it) is left alone rather than
+  guessed. Timings ALWAYS stay the winner's own; a fixed word's
+  syllable parts collapse to the whole word. The copy is flagged
+  `LyricsResult.decensored` with `decensored_from` naming the donor
+  provider; `raw_text` keeps the original censored file (the debug
+  view stays honest), and `is_censored` checks the fixed lines
+  instead, so a fully fixed result reports uncensored and a
+  partially fixed one still reports censored. The status bar names
+  the donor (`… (de-censored from LRCLIB)`); the picker labels such
+  a row "de-censored". The picker itself is never de-censored — it
+  shows the raw candidates, uncensored first. Note: `is_censored_text`
   checks the token's core (via `_split_punct`), so a bare `****`
   with punctuation attached (`****,`) still counts as censored.
+  Regression test: `test_decensor_line_variants` (Y2K & bbno$ —
+  Lalala, real NetEase vs LRCLIB lines).
 - Preferences dialog layout: the content lives in a `QScrollArea`
   (`setWidgetResizable(True)`, horizontal scrollbar off) with the
   OK/Cancel bar outside it — on a small display the dialog scrolls

@@ -669,7 +669,8 @@ def test_decensor_result():
     assert decensor_result(censored, [same]) is None
     # No donor at all.
     assert decensor_result(censored, []) is None
-    # A line of only asterisked words cannot be verified: left alone.
+    # A lone line of only asterisked words, with no neighbours to
+    # anchor it, is left alone.
     all_cens = LyricsResult(artist="X", track="Y", duration=60.0,
                             synced_lines=[_line(5.0, "**** ****",
                                                [_word(5.0, 5.5, "****"),
@@ -698,6 +699,144 @@ def test_decensor_result():
     assert fixed_star.synced_lines[0].words[0].time == 30.0  # timing kept
     assert fixed_star.decensored is True
     print("  decensor_result: OK")
+
+
+def test_decensor_full_asterisk_line_neighbours():
+    """A line of only `****` is filled from the donor when its
+    neighbours prove it is the same line — and left alone when
+    they don't."""
+    def _line(time, text, words=None):
+        return LyricLine(time, text, words=words or [])
+    def _word(time, end, text):
+        return LyricWord(time, end, text)
+    def _res(source, lines, raw):
+        return LyricsResult(artist="X", track="Y", duration=60.0,
+                            synced_lines=lines, source=source, raw_text=raw)
+
+    # Sandwiched between two matching lines: fills, timings kept.
+    censored = _res("qq", [
+        _line(10.0, "My left stroke just went viral"),
+        _line(20.0, "**** ****",
+              [_word(20.0, 20.5, "****"), _word(20.5, 21.0, "****")]),
+        _line(30.0, "sit down please"),
+    ], "My left stroke just went viral\n**** ****\nsit down please")
+    donor = _res("search", [
+        _line(10.1, "My left stroke just went viral"),
+        _line(20.2, "fuck shit"),
+        _line(30.1, "sit down please"),
+    ], "fuck shit")
+    fixed = decensor_result(censored, [donor])
+    assert fixed is not None
+    assert fixed.synced_lines[1].text == "fuck shit"
+    assert fixed.synced_lines[1].words[0].text == "fuck"
+    assert fixed.synced_lines[1].words[0].time == 20.0  # timing kept
+    assert fixed.synced_lines[1].words[1].time == 20.5
+    assert fixed.decensored is True and fixed.decensored_from == "search"
+    assert fixed.is_censored is False
+    assert censored.synced_lines[1].text == "**** ****"  # original untouched
+    # First line, only the next line to anchor it: still fills.
+    first = _res("qq", [
+        _line(5.0, "****", [_word(5.0, 5.5, "****")]),
+        _line(10.0, "hello world"),
+    ], "****\nhello world")
+    first_donor = _res("search", [
+        _line(5.1, "fuck"),
+        _line(10.1, "hello world"),
+    ], "fuck")
+    fixed_first = decensor_result(first, [first_donor])
+    assert fixed_first is not None
+    assert fixed_first.synced_lines[0].text == "fuck"
+    # A neighbour that contradicts the donor refuses the fill, even
+    # though the other neighbour matches.
+    contra = _res("qq", [
+        _line(10.0, "hello world"),
+        _line(20.0, "**** ****",
+              [_word(20.0, 20.5, "****"), _word(20.5, 21.0, "****")]),
+        _line(30.0, "goodbye now"),
+    ], "hello world\n**** ****\ngoodbye now")
+    contra_donor = _res("search", [
+        _line(10.1, "hello world"),
+        _line(20.1, "fuck shit"),
+        _line(30.1, "something else"),
+    ], "fuck shit")
+    assert decensor_result(contra, [contra_donor]) is None
+    # A track that is all asterisks has no anchors anywhere: refused.
+    all_cens = _res("qq", [
+        _line(5.0, "**** ****"),
+        _line(10.0, "****"),
+    ], "**** ****\n****")
+    all_donor = _res("search", [
+        _line(5.1, "fuck shit"),
+        _line(10.1, "damn"),
+    ], "fuck shit")
+    assert decensor_result(all_cens, [all_donor]) is None
+    # Same position and neighbours, but the donor line has a
+    # different word count: refused.
+    count = _res("qq", [
+        _line(10.0, "hello world"),
+        _line(20.0, "**** ****"),
+        _line(30.0, "sit down please"),
+    ], "hello world\n**** ****\nsit down please")
+    count_donor = _res("search", [
+        _line(10.1, "hello world"),
+        _line(20.1, "fuck shit damn"),
+        _line(30.1, "sit down please"),
+    ], "fuck shit damn")
+    assert decensor_result(count, [count_donor]) is None
+    print("  decensor full-asterisk line (neighbours): OK")
+
+
+def test_decensor_line_variants():
+    """Regression: Y2K & bbno$ — Lalala (2026-11-16). The NetEase
+    winner was classified censored but never de-censored, because
+    the LRCLIB donor copy differs on uncensored words: it drops
+    "like", hears "lalalala" for "lalala", "girlie" for "girly",
+    and adds "that". The alignment must still prove both lines
+    the same and swap only the asterisked words, keeping the
+    winner's own words and timings everywhere else."""
+    ne_lrc = ("[00:25.95]I got your b***h singing like lalala, lalala\n"
+              "[00:56.04]I'm corny, but your girly want the d**k")
+    lr_lrc = ("[00:25.92]I got your bitch singing lalalala, lalala\n"
+              "[00:56.77]I'm corny, but your girlie want that dick")
+    censored = LyricsResult(
+        artist="Y2K & bbno$", track="Lalala", duration=160.0,
+        synced_lines=parse_lrc(ne_lrc), source="netease",
+        raw_text=ne_lrc, raw_kind="lrc")
+    donor = LyricsResult(
+        artist="Y2K & bbno$", track="Lalala", duration=160.0,
+        synced_lines=parse_lrc(lr_lrc), source="lrclib",
+        raw_text=lr_lrc, raw_kind="lrc")
+    assert censored.is_censored
+    assert not donor.is_censored
+    fixed = decensor_result(censored, [donor])
+    assert fixed is not None
+    assert fixed.synced_lines[0].text == \
+        "I got your bitch singing like lalala, lalala"
+    assert fixed.synced_lines[0].time == 25.95  # timing kept
+    assert fixed.synced_lines[1].text == \
+        "I'm corny, but your girly want the dick"
+    assert fixed.synced_lines[1].time == 56.04  # timing kept
+    assert fixed.decensored is True and fixed.decensored_from == "lrclib"
+    assert fixed.is_censored is False
+    assert censored.synced_lines[0].text == \
+        "I got your b***h singing like lalala, lalala"  # original untouched
+    # A donor that drops the censored word entirely has nothing to
+    # take — the line is refused, not guessed.
+    dropped = LyricsResult(
+        artist="Y2K & bbno$", track="Lalala", duration=160.0,
+        synced_lines=parse_lrc(
+            "[00:25.92]I got your singing lalala, lalala"),
+        source="lrclib", raw_text="I got your singing lalala, lalala",
+        raw_kind="lrc")
+    one_line = LyricsResult(
+        artist="Y2K & bbno$", track="Lalala", duration=160.0,
+        synced_lines=parse_lrc(
+            "[00:25.95]I got your b***h singing like lalala, lalala"),
+        source="netease",
+        raw_text="I got your b***h singing like lalala, lalala",
+        raw_kind="lrc")
+    assert decensor_result(one_line, [dropped]) is None
+    print("  decensor line variants (Lalala): OK")
 
 
 def test_fetch_lyrics_decensors_from_other_sources():
@@ -995,6 +1134,8 @@ TESTS = [
     test_fetch_lyrics_word_first,
     test_censored_word_match,
     test_decensor_result,
+    test_decensor_full_asterisk_line_neighbours,
+    test_decensor_line_variants,
     test_fetch_lyrics_decensors_from_other_sources,
     test_search_all_candidates_word_only_and_order,
     test_elrc_word_parts,

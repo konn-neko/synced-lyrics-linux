@@ -342,8 +342,16 @@ asterisked words are swapped in from that copy — the lines and their
 timings stay the winner's own, and only words the app can verify
 are swapped: letter-for-letter around the asterisks, or, for a
 fully-asterisked word (`****`), by the rest of the line anchoring
-it. (A line of only asterisks still can't be verified and is left
-alone.) The status bar says who the clean words
+it. "The same line" is judged by alignment, not an exact match:
+different copies of a song routinely disagree on an uncensored
+word or two — one drops a "like", one hears "lalalala" where the
+other hears "lalala" — so the donor line only needs its anchor
+words to line up, in order, at the same timestamp; a censored
+word with no donor counterpart is left alone rather than guessed.
+A line that is only asterisks is proven by its neighbours
+instead — the donor line at the same line number, within a
+second, with the same word count, flanked by lines that match —
+and is left alone when no neighbour can prove it.) The status bar says who the clean words
 came from, e.g. `Word-synced lyrics from QQ Music (de-censored from
 LRCLIB)`, and the raw file in Help > Lyrics debug still shows the
 original censored text exactly as received.

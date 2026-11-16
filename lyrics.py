@@ -34,6 +34,7 @@ Rate limits: ~45 req/min generic, ~90/min identified (Lrclib-Client header).
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import html
 import json
@@ -1201,25 +1202,118 @@ def _donor_words(donor_line: LyricLine) -> list[str]:
     return donor_line.text.split()
 
 
-def _lines_compatible(censored: LyricLine, donor: LyricLine) -> bool:
-    """True when the donor line is provably the same line: same word
-    count, and every non-censored word in the censored line matches
-    the donor word at the same position. At least one such anchor
-    word is required — a line of only asterisked words cannot be
-    verified and never matches."""
+def _align_lines(censored: LyricLine, donor: LyricLine) -> dict[int, int] | None:
+    """Align a censored line to a donor line; `{winner_idx: donor_idx}`
+    when the donor line is provably the same line, else None.
+
+    Different copies of the same song routinely disagree on a word
+    or two — one has "like" where the other doesn't, one hears
+    "shashasha" where the other hears "chachacha", "girly" vs
+    "girlie" — so a strict same-word-count, same-position check
+    refuses donors that are plainly the same line (Y2K & bbno$ —
+    Lalala, 2026-11-16: NetEase's "I got your b***h singing like
+    lalala, lalala" against LRCLIB's "I got your bitch singing
+    lalalala, lalala"). The alignment is therefore done with
+    difflib over the words' punctuation-stripped cores, and the
+    proof is the anchors, not the count:
+
+    - every non-censored winner word must land in an `equal` block
+      (identical, in order, in the donor) — at least one anchor
+      word is required, so a line of only asterisks never matches
+      here (it is proven by its neighbours instead);
+    - a censored word must land in a 1:1 `replace` block, so there
+      is exactly one donor word to take — a censored word in a
+      `delete` block (the donor drops it entirely) or in a
+      many-to-one `replace` refuses the line;
+    - `delete` / `insert` blocks of uncensored words are tolerated:
+      they are transcription variants, and the caller never
+      substitutes them — only asterisked words are ever replaced,
+      and each one still has to pass `_censored_word_match`
+      letter-for-letter around the asterisks.
+    """
     c_words = ([w.text for w in censored.words] if censored.words
                else censored.text.split())
     d_words = _donor_words(donor)
-    if len(c_words) != len(d_words) or not c_words:
-        return False
+    if not c_words or not d_words:
+        return None
+    c_cores = [_split_punct(w)[1].lower() for w in c_words]
+    d_cores = [_split_punct(w)[1].lower() for w in d_words]
+    matcher = difflib.SequenceMatcher(a=c_cores, b=d_cores, autojunk=False)
+    mapping: dict[int, int] = {}
     anchors = 0
-    for c, d in zip(c_words, d_words):
-        if "*" in c:
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                mapping[i1 + k] = j1 + k
+            anchors += i2 - i1
+        elif tag == "replace":
+            if i2 - i1 != j2 - j1:
+                # Ambiguous: several words collapse into fewer (or
+                # vice versa) — refuse if a censored word is in
+                # there, tolerate a pure transcription variant.
+                if any("*" in w for w in c_words[i1:i2]):
+                    return None
+            else:
+                for k in range(i2 - i1):
+                    mapping[i1 + k] = j1 + k
+        elif tag == "delete":
+            # Winner-only words. A censored word with no donor
+            # counterpart has nothing to take — refuse the line.
+            if any("*" in w for w in c_words[i1:i2]):
+                return None
+        # "insert": donor-only words, tolerated (transcription
+        # variant); nothing to map.
+    return mapping if anchors >= 1 else None
+
+
+def _lines_compatible(censored: LyricLine, donor: LyricLine) -> bool:
+    """True when the donor line is provably the same line — see
+    `_align_lines`. At least one anchor word is required; a line of
+    only asterisked words cannot be verified by itself and never
+    matches here; `decensor_result()` can still prove such a line
+    from its neighbours (see `_neighbour_anchored`)."""
+    return _align_lines(censored, donor) is not None
+
+
+def _is_all_censored(line: LyricLine) -> bool:
+    """True when every word in the line is asterisk-censored."""
+    words = ([w.text for w in line.words] if line.words
+             else line.text.split())
+    return bool(words) and all("*" in w for w in words)
+
+
+def _has_anchor_word(line: LyricLine) -> bool:
+    """True when the line has at least one uncensored word."""
+    words = ([w.text for w in line.words] if line.words
+             else line.text.split())
+    return any("*" not in w for w in words)
+
+
+def _neighbour_anchored(result: LyricsResult, donor: LyricsResult,
+                        idx: int) -> bool:
+    """True when a fully-asterisked line at `idx` is proven by its
+    neighbours: the donor line at the same position (same line
+    number) is the candidate, and at least one adjacent line that
+    exists in both copies provably matches at that same position —
+    while no adjacent anchored line contradicts it (an anchored
+    neighbour that does NOT match the donor at the same position
+    means the two copies' segmentation has shifted, so refuse).
+    An all-censored neighbour neither confirms nor contradicts.
+    The caller also checks the candidate's time (within 1.0 s) and
+    word count, so the proof is: same position, same timing, same
+    length, flanked by the same lyrics."""
+    confirmed = False
+    for j in (idx - 1, idx + 1):
+        if not (0 <= j < len(result.synced_lines)
+                and 0 <= j < len(donor.synced_lines)):
             continue
-        if _split_punct(c)[1].lower() != _split_punct(d)[1].lower():
+        neighbour = result.synced_lines[j]
+        d_neighbour = donor.synced_lines[j]
+        if _lines_compatible(neighbour, d_neighbour):
+            confirmed = True
+        elif _has_anchor_word(neighbour):
             return False
-        anchors += 1
-    return anchors >= 1
+    return confirmed
 
 
 def decensor_result(result: LyricsResult,
@@ -1235,7 +1329,17 @@ def decensor_result(result: LyricsResult,
     words; a word is substituted only when it matches the asterisked
     token letter-for-letter around the asterisks — or, when the token
     is fully asterisked (`****`), when the rest of the line anchors
-    it and the donor word is uncensored. Timings ALWAYS stay
+    it. "Provably the same line" is an alignment, not an exact
+    match: the donor may drop or add an uncensored word ("like"),
+    or hear a word differently ("girly" / "girlie", "shashasha" /
+    "chachacha") — see `_align_lines`. A line of only asterisks has
+    no anchor words of its own, so it is proven instead by its
+    neighbours: the donor line at the same line number, within 1.0 s,
+    with the same word count, and at least one adjacent line
+    provably matching at the same position (see
+    `_neighbour_anchored`). A line with no matching neighbour
+    — a lone `****` line, or a track that is all asterisks — is
+    still left alone rather than guessed. Timings ALWAYS stay
     the censored result's own — only word text changes, and a fixed
     word's syllable parts collapse to the whole word (the split is
     lost, the word itself is correct). The copy is flagged
@@ -1254,27 +1358,55 @@ def decensor_result(result: LyricsResult,
         break
     if donor is None:
         return None
-    fixed_lines: list[LyricLine] = []
-    fixed_any = False
+    # First pass: lines provable on their own (anchor words in the
+    # line itself). Record the best donor line per censored line,
+    # with its word alignment — the donor may have a different
+    # word count, so substitutions follow the alignment, not the
+    # position.
+    best_lines: list[tuple[LyricLine, dict[int, int]] | None] = []
     for line in result.synced_lines:
-        best = None
+        best: tuple[LyricLine, dict[int, int]] | None = None
         best_dt = 1.0
         for dline in donor.synced_lines:
             dt = abs(dline.time - line.time)
-            if dt <= best_dt and _lines_compatible(line, dline):
-                best = dline
+            if dt > best_dt:
+                continue
+            mapping = _align_lines(line, dline)
+            if mapping is not None:
+                best = (dline, mapping)
                 best_dt = dt
+        best_lines.append(best)
+    # Second pass: lines of only asterisks, proven by neighbours.
+    for i, line in enumerate(result.synced_lines):
+        if best_lines[i] is not None or not _is_all_censored(line):
+            continue
+        if i >= len(donor.synced_lines):
+            continue
+        dline = donor.synced_lines[i]
+        if abs(dline.time - line.time) > 1.0:
+            continue
+        c_words = ([w.text for w in line.words] if line.words
+                   else line.text.split())
+        if len(c_words) != len(_donor_words(dline)) or not c_words:
+            continue
+        if _neighbour_anchored(result, donor, i):
+            # Same word count here, so the alignment is positional.
+            best_lines[i] = (dline, {k: k for k in range(len(c_words))})
+    fixed_lines: list[LyricLine] = []
+    fixed_any = False
+    for line, best in zip(result.synced_lines, best_lines):
         if best is None:
             fixed_lines.append(line)
             continue
-        d_words = _donor_words(best)
+        best_line, mapping = best
+        d_words = _donor_words(best_line)
         c_words = ([w.text for w in line.words] if line.words
                    else line.text.split())
         new_text = line.text
         new_words: list[LyricWord] = []
         for idx, c in enumerate(c_words):
-            d = d_words[idx]
-            if "*" in c and _censored_word_match(c, d):
+            d = d_words[mapping[idx]] if idx in mapping else None
+            if d is not None and "*" in c and _censored_word_match(c, d):
                 lead, _core, trail = _split_punct(c)
                 _d_lead, d_core, _d_trail = _split_punct(d)
                 fixed = lead + d_core + trail
