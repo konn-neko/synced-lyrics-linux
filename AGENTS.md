@@ -490,7 +490,10 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   would release nothing. A failing test exits 1, not 139, so the exit code
   is CI-trustworthy: `.github/workflows/tests.yml` runs `test_lyrics.py`
   with `LYRICS_LIVE_TESTS=0` plus this suite offscreen under
-  `dbus-run-session` on PRs and pushes to main.
+  `dbus-run-session` on PRs and pushes to main. The smoke step does not
+  trust exit 0 alone: it asserts at least 30 `: OK` lines and the
+  `MPRIS Seeked subscription: OK` line, so a silently skipped check fails
+  the job, and a `concurrency` group cancels the run a newer push replaces.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo
