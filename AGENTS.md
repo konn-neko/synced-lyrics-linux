@@ -500,11 +500,18 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   `smoke.log` as the `suite-logs-*` artifact on every run (`if: always()`, 7
   days): a failed or cancelled run keeps its partial logs, so it can be
   diagnosed without authenticated log access. A `Write run summary` step
-  (`if: always()`) also puts a per-suite passed/skipped/failed table, each
-  suite's final line and every failing check into `$GITHUB_STEP_SUMMARY`, so a
-  red run is readable from the public run page alone. `workflow_dispatch` lets
-  a maintainer start (and cancel) a run without pushing a commit, which is how
-  the cancelled-run behaviour is tested.
+  (`if: always()`) writes a per-suite passed/skipped/failed table, each
+  suite's final line and every failing check to `$GITHUB_STEP_SUMMARY`, and
+    emits the same counts as `::notice::` annotations (failures as `::error::`).
+  One signed-out view of this repo showed an empty summary panel while
+  annotations did render, so the annotations are the dependable public channel
+  — but that was a single observation, not a documented GitHub rule: treat the
+  summary panel's behaviour for anonymous viewers as unverified and read the
+  annotations (or the artifact) when diagnosing a red run.
+ `workflow_dispatch` lets a maintainer start (and
+  cancel) a run without pushing a commit, which is how the cancelled-run
+  behaviour is tested — note that runs finish in ~40-75 s, so cancelling from
+  outside is timing-sensitive; cancel it from the UI instead.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo
@@ -543,7 +550,11 @@ offscreen has one virtual display, so `--screen 1` falls back to primary.
   Players come from MPRIS discovery; displays from `screens()`.
 - No second MPRIS poller. One engine, shared by all windows.
 - No Electron, no webview, no extra runtime dependencies beyond PySide6.
-- No pushing to GitHub from an agent run — repo creation/push is done
-  by the maintainer (parent agent). Make the folder push-ready instead.
+- Pushing: the maintainer owns the remote. Push only when asked, through the
+  connected GitHub app (`cloud_git`, branch `main`), never by putting a token
+  in a command or a file. The agent's push path cannot force-push, so history
+  rewrites (`git rebase`/squash/amend of pushed commits) have to be pushed by
+  the maintainer; prepare and verify the rewritten branch locally and say so
+  plainly instead of claiming it landed. Never rewrite history unasked.
 - Do not "fix" browser 1 s position granularity by polling faster;
   interpolation is the intended mechanism.
