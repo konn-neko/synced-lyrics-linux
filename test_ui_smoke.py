@@ -16,11 +16,15 @@ snapping: the Full App / Overlay windows themselves are heavy to
 construct headlessly, so the helpers are tested directly and the
 --demo smoke run exercises the windows end to end.
 """
+import gc
 import os
 import re
 import sys
 import tempfile
 import time as _time
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -238,37 +242,21 @@ def test_render_line_html():
 
 
 def test_monotonic_position():
-    """Browser-style floored reports must never drag the estimate back.
-
-    Flat reports at 30.0 re-adopt each poll (within the 0.5 s
-    tolerance), so the estimate sits at the report — never below it,
-    never decreasing. A report behind the estimate by more than the
-    tolerance is stale/floored and ignored, so the estimate keeps
-    interpolating forward from the anchor instead of sawtoothing.
-    """
+    """Floored reports interpolate, while seeks and pause transitions reset."""
     pos = MonotonicPosition()
     t0 = 1000.0
-    est = [pos.observe(30.0, t0 + i * 0.25, playing=True) for i in range(5)]
-    assert est == [30.0] * 5, est
-    assert all(b >= a for a, b in zip(est, est[1:]))
-
-    pos2 = MonotonicPosition()
-    pos2.observe(30.0, t0, playing=True)
-    assert abs(pos2.estimate(t0 + 0.9, playing=True) - 30.9) < 1e-9
-    # Stale report (30.0 is 0.9 s behind the 30.9 estimate): ignored.
-    assert abs(pos2.observe(30.0, t0 + 0.9, playing=True) - 30.9) < 1e-9
-    # The new second is adopted when the report jumps ahead.
-    assert abs(pos2.observe(31.0, t0 + 1.0, playing=True) - 31.0) < 1e-9
-    # Genuine backward seek (big jump) IS adopted...
-    assert abs(pos2.observe(10.0, t0 + 1.25, playing=True) - 10.0) < 1e-9
-    # ...but a report 0.65 s behind the new anchor is stale: ignored.
-    assert abs(pos2.observe(9.6, t0 + 1.5, playing=True) - 10.25) < 1e-9
-    assert abs(pos2.estimate(t0 + 1.75, playing=True) - 10.5) < 1e-9
-    # Paused: the estimate freezes at the anchor.
-    frozen = MonotonicPosition()
-    frozen.observe(5.0, t0, playing=True)
-    assert frozen.estimate(t0 + 10.0, playing=False) == 5.0
-    print("  MonotonicPosition: OK (no sawtooth, seek back adopted, paused freezes)")
+    estimates = [pos.observe(30.0, t0 + i * 0.25, playing=True) for i in range(4)]
+    assert estimates == [30.0, 30.25, 30.5, 30.75], estimates
+    assert pos.observe(31.0, t0 + 1.0, playing=True) == 31.0
+    assert pos.observe(10.0, t0 + 1.25, playing=True) == 10.0
+    assert pos.discontinuity
+    assert pos.observe(9.6, t0 + 1.5, playing=True) == 10.25
+    assert not pos.discontinuity
+    assert pos.observe(9.6, t0 + 1.75, playing=False) == 10.5
+    assert pos.estimate(t0 + 2.5, playing=False) == 10.5
+    assert pos.observe(9.6, t0 + 2.75, playing=True) == 10.5
+    assert pos.estimate(t0 + 3.0, playing=True) == 10.75
+    print("  MonotonicPosition: OK (interpolation, seeks, pause/resume)")
 
 
 def test_engine_position_monotonic(app):
@@ -302,6 +290,441 @@ def test_engine_position_monotonic(app):
     finally:
         engine.stop()
     print("  engine position: OK (emitted position monotonic, line idx never flips back)")
+
+
+@contextmanager
+def _seek_harness():
+    """PlaybackEngine on a fake clock and player, with no real MPRIS.
+
+    Yields a namespace with `engine`, the `clock` / `get_track` / `seek`
+    mocks, the `mpris` / `playback` modules, a `track()` factory, recorded
+    `seen` [(pos, idx)] / `positions` / `statuses`, and `at(t)` to set the
+    fake clock. `_subscribe_seek_events` is stubbed, so tests that need the
+    event path set `_seek_bus` / `_seek_service` themselves. The engine is
+    stopped on exit.
+    """
+    import mpris
+    import playback
+
+    engine = PlaybackEngine(demo=True)
+    engine._timer.stop()
+    engine._players_timer.stop()
+    engine.demo = False
+    engine.player = "test"
+    engine._fetch_lyrics = lambda track: None
+    engine.lyrics = LyricsResult(artist="A", track="T", synced_lines=[
+        LyricLine(0, "start"), LyricLine(20, "twenty"), LyricLine(90, "ninety")])
+    seen, positions, statuses = [], [], []
+    engine.position_changed.connect(lambda pos, idx: seen.append((pos, idx)))
+    engine.position_changed.connect(lambda pos, idx: positions.append(pos))
+    engine.status_changed.connect(statuses.append)
+
+    def track(position, title="T", status="Playing"):
+        return mpris.TrackInfo(player="test", artist="A", title=title,
+                               position=position, status=status)
+
+    with patch.object(playback.time, "monotonic") as clock, \
+         patch.object(mpris, "get_track") as get_track, \
+         patch.object(mpris, "seek", return_value=True) as seek, \
+         patch.object(engine, "_subscribe_seek_events"):
+        try:
+            yield SimpleNamespace(
+                engine=engine, clock=clock, get_track=get_track, seek=seek,
+                mpris=mpris, playback=playback, track=track, seen=seen,
+                positions=positions, statuses=statuses,
+                at=lambda value: setattr(clock, "return_value", value))
+        finally:
+            engine._seek_bus = None
+            engine._seek_service = ""
+            engine.stop()
+
+
+def test_engine_seek_and_track_sync(app):
+    with _seek_harness() as h:
+        engine, track, seen = h.engine, h.track, h.seen
+        h.at(1000.0)
+        h.get_track.return_value = track(100)
+        engine.poll()
+        assert seen[-1] == (100.0, 2)
+        h.at(1000.25)
+        h.get_track.return_value = track(20)
+        engine.poll()
+        assert seen[-1] == (20.0, 1)  # external backward seek
+        assert engine.current_position() == 20.0
+        h.at(1000.5)
+        h.get_track.return_value = track(20, title="New")
+        engine.poll()
+        assert seen[-1][0] == 20.0  # new track must reset the anchor
+        h.seek.return_value = False
+        engine.seek(5)
+        assert engine.current_position() == 20.0
+        h.seek.return_value = True
+        engine.seek(5)
+        assert seen[-1] == (5.0, 0)
+        h.at(1000.75)
+        h.get_track.return_value = track(5, title="New", status="Paused")
+        engine.poll()
+        frozen = engine.current_position()
+        h.at(1001.75)
+        h.get_track.return_value = track(5, title="New", status="Playing")
+        engine.poll()
+        assert engine.current_position() == frozen
+        h.at(1002.0)
+        assert engine.current_position() == frozen + 0.25
+    print("  engine sync: OK (seek, track change, failed seek, pause/resume)")
+
+
+def test_engine_delayed_seek_reports(app):
+    """A successful local seek survives old reports in either direction."""
+    with _seek_harness() as h:
+        engine, track, seen, at = h.engine, h.track, h.seen, h.at
+        for start, target, expected_idx in ((100, 20, 1), (20, 100, 2)):
+            at(1000.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            at(1001.0)
+            engine.seek(target)
+            assert seen[-1] == (float(target), expected_idx)
+            for elapsed, report in ((0.25, start), (0.5, start),
+                                    (0.75, target), (1.0, start),
+                                    (1.25, target + 1)):
+                at(1001.0 + elapsed)
+                h.get_track.return_value = track(report)
+                engine.poll()
+                assert seen[-1] == (target + elapsed, expected_idx), seen[-1]
+                assert engine.current_position() == seen[-1][0]
+            # The same stale report, well after five seconds and after
+            # confirmation, must not undo the seek. A sustained external
+            # seek must still be recognized in either direction.
+            at(1007.0)
+            h.get_track.return_value = track(start)
+            engine.poll()
+            assert h.positions[-1] == target + 6.0
+            at(1007.25)
+            external = 150 if target == 20 else 10
+            h.get_track.return_value = track(external)
+            engine.poll()
+            assert h.positions[-1] == target + 6.25
+            for step in range(1, 13):
+                at(1007.25 + step * 0.25)
+                h.get_track.return_value = track(external + step // 4)
+                engine.poll()
+            assert h.positions[-1] == external + 3
+
+        # Stale reports beyond five seconds and up to the bounded
+        # protection window, in both directions.
+        for start, target in ((100, 20), (20, 100)):
+            at(1200.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            engine.seek(target)
+            at(1208.0)
+            h.get_track.return_value = track(start + 8)
+            engine.poll()
+            assert h.positions[-1] == target + 8.0
+            at(1208.25)
+            h.get_track.return_value = track(target + 8)
+            engine.poll()
+            assert h.positions[-1] == target + 8.25
+            at(1209.0)
+            h.get_track.return_value = track(start + 9)
+            engine.poll()
+            assert h.positions[-1] == target + 9.0
+
+        # Without an event, a sustained external seek eventually wins,
+        # even if the requested local target was never reported.
+        for start, target, external in ((100, 20, 150), (20, 100, 5)):
+            at(1300.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            engine.seek(target)
+            for step in range(13):
+                at(1300.25 + step * 0.25)
+                h.get_track.return_value = track(external + step // 4)
+                engine.poll()
+            assert h.positions[-1] == external + 3
+
+        # Rounded reports near a fractional seek must not rewind it.
+        at(1500.0)
+        h.get_track.return_value = track(30)
+        engine.poll()
+        engine.seek(10.9)
+        at(1500.25)
+        h.get_track.return_value = track(10)
+        engine.poll()
+        assert abs(h.positions[-1] - 11.15) < 1e-9
+        at(1500.5)
+        h.get_track.return_value = track(11)
+        engine.poll()
+        assert abs(h.positions[-1] - 11.4) < 1e-9
+
+        # Overlapping seeks in both directions protect the original
+        # timeline and the intermediate target after confirmation.
+        for start, first, target in ((20, 100, 40), (100, 20, 60)):
+            at(2000.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            engine.seek(first)
+            at(2000.25)
+            engine.seek(target)
+            h.get_track.return_value = track(first)
+            engine.poll()
+            assert h.positions[-1] == float(target)
+            at(2000.5)
+            h.get_track.return_value = track(target)
+            engine.poll()
+            for elapsed, report in ((5, start), (5.25, first)):
+                at(2000.25 + elapsed)
+                h.get_track.return_value = track(report)
+                engine.poll()
+                assert h.positions[-1] == target + elapsed
+            at(2008.0)
+            h.get_track.return_value = track(first)
+            engine.poll()
+            assert h.positions[-1] == target + 7.75
+
+        # Track changes reset reconciliation state.
+        at(2011.25)
+        h.get_track.return_value = track(5, title="New")
+        engine.poll()
+        assert h.positions[-1] == 5.0
+
+        # Paused seeks freeze while the old position is reported.
+        at(3000.0)
+        h.get_track.return_value = track(100, title="Paused", status="Paused")
+        engine.poll()
+        engine.seek(20)
+        at(3005.0)
+        engine.poll()
+        assert h.positions[-1] == 20.0
+        assert engine.current_position() == 20.0
+    print("  delayed seek reports: OK (both directions, overlaps, pause, track change)")
+
+
+def test_engine_seeked_events_and_fallback(app):
+    """Signals override ambiguous reports; silent players eventually recover."""
+    with _seek_harness() as h:
+        engine, track, seen, at = h.engine, h.track, h.positions, h.at
+        # Simulate the subscribed transport. Its actual DBus wiring is
+        # tested separately under dbus-run-session.
+        engine._seek_bus = object()
+        engine._seek_service = "org.mpris.MediaPlayer2.test"
+        for start, target in ((100, 20), (20, 100)):
+            at(1000.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            engine.seek(target)
+            at(1000.25)
+            engine._on_mpris_seeked(target * 1_000_000)
+            at(1008.0)
+            h.get_track.return_value = track(start)
+            engine.poll()
+            assert seen[-1] == target + 8
+            assert "uncertain" in h.statuses[-1]
+            # A real external seek to the old position wins immediately.
+            at(1008.25)
+            engine._on_mpris_seeked(start * 1_000_000)
+            assert seen[-1] == float(start)
+            at(1008.5)
+            h.get_track.return_value = track(target)
+            engine.poll()
+            assert seen[-1] == start + 0.25
+
+        # Late acknowledgements of older overlapping local seeks must
+        # not undo the newer target, regardless of their delivery order.
+        for start, first, target in ((20, 100, 40), (100, 20, 60)):
+            for latest_first in (False, True):
+                at(2000.0)
+                engine.track = h.mpris.TrackInfo()
+                h.get_track.return_value = track(start)
+                engine.poll()
+                engine.seek(first)
+                at(2000.25)
+                engine.seek(target)
+                events = (target, first) if latest_first else (first, target)
+                for event in events:
+                    engine._on_mpris_seeked(event * 1_000_000)
+                    assert seen[-1] == float(target)
+                at(2008.25)
+                for report in (start, first):
+                    h.get_track.return_value = track(report)
+                    engine.poll()
+                    assert seen[-1] == target + 8
+                engine._on_mpris_seeked(start * 1_000_000)
+                assert seen[-1] == float(start)
+
+        # With no event, a sustained run at the old position wins after
+        # three seconds. This is deliberately a heuristic, not proof.
+        engine._seek_bus = None
+        engine._seek_service = ""
+        for start, target in ((100, 20), (20, 100)):
+            at(3000.0)
+            engine.track = h.mpris.TrackInfo()
+            h.get_track.return_value = track(start)
+            engine.poll()
+            engine.seek(target)
+            for step in range(13):
+                at(3000.25 + step * 0.25)
+                h.get_track.return_value = track(start + step // 4)
+                engine.poll()
+                if step < 12:
+                    assert seen[-1] == target + (step + 1) * 0.25
+            assert seen[-1] == start + 3
+            assert "ambiguous" in h.statuses[-1]
+
+        # An acknowledgement inside the window must not rewind the
+        # already interpolated target.
+        engine._seek_bus = object()
+        engine._seek_service = "org.mpris.MediaPlayer2.test"
+        at(3500.0)
+        engine.track = h.mpris.TrackInfo()
+        h.get_track.return_value = track(20)
+        engine.poll()
+        engine.seek(100)
+        at(3502.0)
+        engine._on_mpris_seeked(100_000_000)
+        assert engine.current_position() == 102.0
+
+        # Reentrant event delivery from a blocking command is deferred
+        # until success is known, without applying a failed local seek.
+        at(4000.0)
+        engine.track = h.mpris.TrackInfo()
+        h.get_track.return_value = track(30)
+        engine.poll()
+        with patch.object(h.mpris, "seek", side_effect=lambda *_: (
+                engine._on_mpris_seeked(70_000_000), True)[1]):
+            engine.seek(70)
+        assert seen[-1] == 70.0
+        with patch.object(h.mpris, "seek", return_value=False):
+            engine.seek(10)
+        assert seen[-1] == 70.0
+    print("  seek events and fallback: OK")
+
+
+def test_seek_reconciliation_caps(app):
+    """Bounded fallback protection and a bounded acknowledgement window."""
+    with _seek_harness() as h:
+        engine, track, seen, at = h.engine, h.track, h.positions, h.at
+        # Without events, reports that never form a coherent run must
+        # not shield the seek forever: protection expires after 10 s.
+        engine._seek_bus = None
+        engine._seek_service = ""
+        at(5000.0)
+        engine.track = h.mpris.TrackInfo()
+        h.get_track.return_value = track(20)
+        engine.poll()
+        engine.seek(100)
+        assert seen[-1] == 100.0
+        for step in range(1, 41):
+            at(5000.0 + step * 0.25)
+            h.get_track.return_value = track(40 if step % 2 else 70)
+            engine.poll()
+            if step < 40:
+                assert seen[-1] == 100.0 + step * 0.25, (step, seen[-1])
+        assert seen[-1] == 70.0  # protection expired, player followed
+        assert "not confirmed" in h.statuses[-1], h.statuses[-1]
+        at(5010.25)
+        h.get_track.return_value = track(70)
+        engine.poll()
+        assert seen[-1] == 70.25
+
+        # A pending local target must not swallow a genuine later event.
+        engine._seek_bus = object()
+        engine._seek_service = "org.mpris.MediaPlayer2.test"
+        at(6000.0)
+        engine.track = h.mpris.TrackInfo()
+        h.get_track.return_value = track(50)
+        engine.poll()
+        engine.seek(100)
+        at(6002.0)
+        engine._on_mpris_seeked(100_000_000)  # delayed ack: no rewind
+        assert engine.current_position() == 102.0
+
+        engine.seek(100)  # never acknowledged by this player
+        at(6002.5)
+        engine._on_mpris_seeked(30_000_000)  # unrelated genuine seek
+        assert seen[-1] == 30.0
+
+        engine.seek(100)
+        at(6100.0)
+        engine._on_mpris_seeked(100_000_000)  # same position, much later
+        assert seen[-1] == 100.0
+        assert engine.current_position() == 100.0
+    print("  seek reconciliation caps: OK")
+
+
+def test_mpris_seeked_subscription(app):
+    """Exercise the actual QtDBus signal, including player switch and stop."""
+    from unittest.mock import patch
+    from PySide6.QtCore import ClassInfo, QObject, Signal
+    from PySide6.QtDBus import QDBusConnection
+    import mpris
+
+    bus = QDBusConnection.sessionBus()
+    if not bus.isConnected():
+        print("  MPRIS Seeked subscription: SKIP (no session bus)")
+        return
+
+    @ClassInfo(**{"D-Bus Interface": "org.mpris.MediaPlayer2.Player"})
+    class FakePlayer(QObject):
+        Seeked = Signal("qlonglong")
+
+    suffix = str(os.getpid())
+    names = ["FakeA" + suffix, "FakeB" + suffix]
+    connections = [QDBusConnection.connectToBus(QDBusConnection.BusType.SessionBus,
+                                               "test-seek-" + name) for name in names]
+    players = [FakePlayer(), FakePlayer()]
+    engine = PlaybackEngine(demo=True)
+    engine._timer.stop()
+    engine._players_timer.stop()
+    engine.demo = False
+    engine._fetch_lyrics = lambda track: None
+    seen = []
+    engine.position_changed.connect(lambda pos, idx: seen.append(pos))
+
+    def pump():
+        deadline = _time.monotonic() + 0.2
+        while _time.monotonic() < deadline:
+            app.processEvents()
+            _time.sleep(0.002)
+
+    try:
+        for conn, name, player in zip(connections, names, players):
+            assert conn.isConnected()
+            assert conn.registerService("org.mpris.MediaPlayer2." + name)
+            assert conn.registerObject("/org/mpris/MediaPlayer2", player,
+                                       QDBusConnection.RegisterOption.ExportAllSignals)
+        with patch.object(mpris, "get_track", side_effect=lambda name: mpris.TrackInfo(
+                player=name, artist="A", title="T", position=20, status="Paused")):
+            engine.set_player(names[0])
+            assert engine._seek_service.endswith(names[0])
+            players[0].Seeked.emit(100_123_456)
+            pump()
+            assert seen[-1] == 100.123456
+            engine.set_player(names[1])
+            count = len(seen)
+            players[0].Seeked.emit(40_000_000)
+            pump()
+            assert len(seen) == count
+            players[1].Seeked.emit(50_000_000)
+            pump()
+            assert seen[-1] == 50.0
+            engine.stop()
+            count = len(seen)
+            players[1].Seeked.emit(60_000_000)
+            pump()
+            assert len(seen) == count
+    finally:
+        engine.stop()
+        for conn, name in zip(connections, names):
+            conn.unregisterService("org.mpris.MediaPlayer2." + name)
+            QDBusConnection.disconnectFromBus("test-seek-" + name)
+    print("  MPRIS Seeked subscription: OK")
 
 
 def _html_spans(html_text):
@@ -855,6 +1278,24 @@ def test_demo_word_highlight(app):
     print("  demo word highlight: OK (Full App item + Overlay label carry word HTML)")
 
 
+def _teardown_qt(app):
+    """Destroy the tests' widgets, then the QApplication, in that order.
+
+    Qt must not outlive its application: if the interpreter destroys
+    leftover windows after QApplication is gone (main()'s local goes out
+    of scope at return), PySide6 crashes during shutdown — intermittently
+    SIGSEGV, and reproducibly SIGBUS after the PreferencesDialog tests.
+    Closing and deleting the top-level widgets first makes the full suite
+    exit 0, which CI can trust.
+    """
+    app.closeAllWindows()
+    for widget in app.topLevelWidgets():
+        widget.deleteLater()
+    app.processEvents()
+    del app
+    gc.collect()
+
+
 def main():
     app = QApplication(sys.argv)
     test_build_display_menu(app)
@@ -880,7 +1321,13 @@ def main():
     test_lyrics_delegate_and_scroll(app)
     test_monotonic_position()
     test_engine_position_monotonic(app)
+    test_engine_seek_and_track_sync(app)
+    test_engine_delayed_seek_reports(app)
+    test_engine_seeked_events_and_fallback(app)
+    test_seek_reconciliation_caps(app)
+    test_mpris_seeked_subscription(app)
     test_demo_word_highlight(app)
+    _teardown_qt(app)
     print("test_ui_smoke: OK — all checks passed")
     return 0
 

@@ -44,12 +44,28 @@ no login, no API keys.
   report Position in 1 s steps, so a naive anchor reset sawtooths the
   estimate back to the floored value on every poll — if a line boundary
   falls in that window, `line_at()` flips back and forth and the scroll
-  glide gets retargeted forever. The anchor is adopted only when the
-  report is ahead of the estimate minus 0.5 s, or more than 2.0 s away
-  either way (a real seek); a report behind the estimate by more than
-  0.5 s is stale and ignored. `seek()` sets the anchor explicitly.
+  glide gets retargeted forever. Repeated or slightly behind reports
+  do not rewind the interpolated anchor; a backward report jump over
+  0.5 s or a forward jump over 2 s is treated as a seek. The anchor
+  freezes while paused, and `seek()` sets it only on success. QtDBus
+  listens to the selected player's `Seeked(qlonglong)` event (microseconds)
+  and immediately applies external events, including seeks to old positions.
+  A bounded list of local targets identifies delayed local acknowledgements,
+  including overlapping seeks, but only while the target is younger than
+  three seconds: `Seeked` has no request ID, so a longer window would swallow
+  a genuine later seek to the same position. Track/player switches clear this
+  state. Position-only reconciliation protects a local/event seek from
+  isolated conflicting reports, surfaces uncertainty in the status bar, and
+  adopts a consistent conflicting run after three seconds with no gap over
+  1.5 seconds between reports. Protection is itself capped at ten
+  seconds: if reports never converge the anchor follows the player and the
+  status bar says the seek was not confirmed. A stale report is still
+  indistinguishable from an unannounced external seek, so the fallback is
+  evidence-based, never proof; status changes always apply. The fallback also
+  covers players that never send `Seeked` even when the bus subscription
+  succeeds.
   `_emit_position()` additionally clamps to the last emitted value
-  (`_emit_floor`, reset on seek / track change / player change) so
+  (`_emit_floor`, reset on detected seek / track change / player change) so
   microsecond scheduling jitter can never flip the line index back.
   Demo mode keeps its own position logic and is untouched by this.
 - If QtDBus fails / no players, fall back to `playerctl -l` and
@@ -297,16 +313,16 @@ no login, no API keys.
   Preferences > Sync > "De-censor lyrics using other sources",
   config `decensor`): when the auto-fetch winner is censored, the
   app asks `search_all_candidates` for the other providers' copies
-  of the same track and swaps asterisked words from the first
-  uncensored donor with synced lines. A word is swapped only when
+  of the same track and swaps verified asterisked words from
+  uncensored donors with synced lines. A word is swapped only when
   `_uncensored_word` proves it — same length, every non-`*`
   letter matches at the same position (`f**k` → `fuck`, `Sh*t` →
   `shit`); a donor's dropped-g spelling such as `fuckin'` can match
   `f**king` when the winner's `g` is visible. A fully-asterisked word
-  (`****`) takes the donor word
-  when the rest of the line anchors it (a line of only asterisks
-  still cannot be verified — no anchor words). A donor word that
-  is itself asterisked never matches. "The same line" is an
+  (`****`) requires two independent providers to agree on the complete
+  masked phrase, plus either at least two matching anchors on the same line or matching adjacent
+  lines for a fully masked line. A donor word that is itself
+  asterisked never matches. "The same line" is an
   alignment (`_align_lines`, difflib over the words' cores), NOT
   an exact match: different copies disagree on uncensored words
   (one drops a "like", "girly" vs "girlie", "shashasha" vs
@@ -314,12 +330,12 @@ no login, no API keys.
   line up in order at the same timestamp — a censored word with no
   donor counterpart (the donor drops it) is left alone rather than
   guessed. Copies also split lines differently (one line in the
-  winner can be two lines in the donor), so when no single donor
-  line aligns, runs of 2–3 consecutive donor lines are tried
+  winner can be two lines in the donor), so runs of 2–3 consecutive
+  donor lines are also tried
   merged, with the winner line falling inside the merged run's
   time span. And every uncensored donor is tried line by line —
   the first donor may fix some lines while a later one fixes the
-  rest. Timings ALWAYS stay the winner's own; a fixed word's
+  rest. Timings ALWAYS stay the winner's own; only a fixed word's
   syllable parts collapse to the whole word. The copy is flagged
   `LyricsResult.decensored` with `decensored_from` naming the
   donor that supplied the most fixed words (ties: first in pool
@@ -451,6 +467,22 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   wiped on VM replacement. The venv also needs system libEGL —
   installed 2026-11-14 from the libegl1 + libegl-mesa0 .debs after
   `apt-get update` hung on a mirror.)
+  No-root recipe (used when the image has no sudo and empty apt lists):
+  `apt-get -o Dir::State::lists=/tmp/aptdl/lists -o Debug::NoLocking=1 update`,
+  then `apt-get -o Dir::State::lists=/tmp/aptdl/lists -o Debug::NoLocking=1
+  download libxkbcommon0 libxkbcommon-x11-0 libegl1 libglvnd0 libfreetype6
+  libfontconfig1 libexpat1 libuuid1 libpng16-16t64 libbrotli1 libbz2-1.0
+  libdbus-1-3`, `dpkg-deb -x` each .deb into `~/.local/qtlibs`, and run with
+  `LD_LIBRARY_PATH=~/.local/qtlibs/usr/lib/x86_64-linux-gnu`. With that, the
+  FULL `test_ui_smoke.py` suite runs offscreen, passes every check and
+  exits 0. (Fontconfig may log one harmless "Cannot load default config
+  file" warning; unpacking `fonts-dejavu-core` plus a `fonts.conf` silences
+  it but is not needed for a clean exit.)
+  `main()` ends with `_teardown_qt()`: Qt objects must not outlive their
+  QApplication, or PySide6 crashes during interpreter shutdown — a random
+  SIGSEGV, and a reproducible SIGBUS after the `PreferencesDialog` tests.
+  The helper closes and deletes the tests' top-level windows, pumps the
+  event loop, then drops the app, so the exit code is CI-trustworthy.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo

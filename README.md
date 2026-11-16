@@ -107,7 +107,15 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
   scrolls on small screens instead of squashing its content.
 - **Any MPRIS player** — Spotify desktop, YouTube Music in Firefox /
   Chromium, VLC, Elisa… discovered automatically, no player names
-  hardcoded. Player selector dropdown when several are playing.
+  hardcoded. Player selector dropdown when several are playing. Seek
+  events update sync immediately. When a player sends no event, the app
+  flags conflicting position reports as uncertain and resynchronizes after
+  three seconds of consistent reports; protection lasts at most ten seconds,
+  after which it follows the player and says the seek was not confirmed. A
+  delayed `Seeked` acknowledgement is only matched to a local seek for three
+  seconds, so a later real seek to the same position is not swallowed.
+  Persistent stale reports can look identical to a real seek, so this
+  fallback cannot always tell them apart.
 - **Synced lyrics from LRCLIB** — free, no key. Line-level sync, with
   plain-lyrics and instrumental fallbacks, and a disk cache in
   `~/.cache/synced-lyrics-linux/`.
@@ -341,15 +349,17 @@ another provider has an uncensored copy of the same song, the
 asterisked words are swapped in from that copy — the lines and their
 timings stay the winner's own, and only words the app can verify
 are swapped: letter-for-letter around the asterisks, or, for a
-fully-asterisked word (`****`), by the rest of the line anchoring
-it. "The same line" is judged by alignment, not an exact match:
+fully-asterisked word (`****`), by stronger line or neighbouring-line
+anchors and agreement from two distinct providers on the entire masked
+phrase. Ambiguous words stay
+censored. "The same line" is judged by alignment, not an exact match:
 different copies of a song routinely disagree on an uncensored
 word or two — one drops a "like", one hears "lalalala" where the
 other hears "lalala" — so the donor line only needs its anchor
 words to line up, in order, at the same timestamp; a censored
 word with no donor counterpart is left alone rather than guessed.
-Copies also split lines differently, so when no single donor line
-matches, runs of 2–3 consecutive donor lines are tried merged,
+Copies also split lines differently, so runs of 2–3 consecutive
+donor lines are also tried merged,
 and every uncensored donor is tried line by line — the fix takes
 the best match across the whole pool, not just the first donor.
 A line that is only asterisks is proven by its neighbours

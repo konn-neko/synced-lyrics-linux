@@ -1262,15 +1262,6 @@ def _align_lines(censored: LyricLine, donor: LyricLine) -> dict[int, int] | None
     return mapping if anchors >= 1 else None
 
 
-def _lines_compatible(censored: LyricLine, donor: LyricLine) -> bool:
-    """True when the donor line is provably the same line — see
-    `_align_lines`. At least one anchor word is required; a line of
-    only asterisked words cannot be verified by itself and never
-    matches here; `decensor_result()` can still prove such a line
-    from its neighbours (see `_neighbour_anchored`)."""
-    return _align_lines(censored, donor) is not None
-
-
 def _is_all_censored(line: LyricLine) -> bool:
     """True when every word in the line is asterisk-censored."""
     words = ([w.text for w in line.words] if line.words
@@ -1305,10 +1296,21 @@ def _neighbour_anchored(result: LyricsResult, donor: LyricsResult,
             continue
         neighbour = result.synced_lines[j]
         d_neighbour = donor.synced_lines[j]
-        if _lines_compatible(neighbour, d_neighbour):
-            confirmed = True
-        elif _has_anchor_word(neighbour):
+        if not _has_anchor_word(neighbour):
+            continue
+        mapping = _align_lines(neighbour, d_neighbour)
+        c_words = ([w.text for w in neighbour.words] if neighbour.words
+                   else neighbour.text.split())
+        d_words = _donor_words(d_neighbour)
+        anchors = [i for i, word in enumerate(c_words)
+                   if "*" not in _split_punct(word)[1]]
+        if (mapping is None or any(
+                i not in mapping or
+                _split_punct(c_words[i])[1].casefold() !=
+                _split_punct(d_words[mapping[i]])[1].casefold()
+                for i in anchors)):
             return False
+        confirmed = True
     return confirmed
 
 
@@ -1331,20 +1333,21 @@ def decensor_result(result: LyricsResult,
     the same asterisks), line by line, not just the first donor:
     one donor's copy may segment a line differently while another's
     matches, so each censored line takes its best match across the
-    whole pool. For each censored line, the nearest donor line in
-    time (within 1.0 s) that is provably the same line lends its
-    words; a word is substituted only when it matches the asterisked
-    token letter-for-letter around the asterisks — or, when the token
-    is fully asterisked (`****`), when the rest of the line anchors
-    it. "Provably the same line" is an alignment, not an exact
+    whole pool. For each censored word, the nearest donor line in
+    time (within 1.0 s) with a verified replacement lends its word;
+    a word is substituted only when it matches the asterisked
+    token letter-for-letter around the asterisks. Fully masked words
+    also require independent providers to agree on the entire masked
+    phrase; their nearby line anchors must not contradict the winner.
+    "Provably the same line" is an alignment, not an exact
     match: the donor may drop or add an uncensored word ("like"),
     or hear a word differently ("girly" / "girlie", "shashasha" /
     "chachacha") — see `_align_lines`. Copies also split lines
     differently — one line in the winner can be two lines in the
     donor ("Like Britney b***h I drop you…" vs "…like Britney,
-    bitch" + "I drop you…", Ashnikko — Toxic, 2026-11-16) — so when
-    no single donor line aligns, runs of 2–3 consecutive donor
-    lines are tried merged, and the winner line must fall inside
+    bitch" + "I drop you…", Ashnikko — Toxic, 2026-11-16) — so
+    runs of 2–3 consecutive donor lines are also tried merged,
+    and the winner line must fall inside
     the merged run's time span. A line of only asterisks has
     no anchor words of its own, so it is proven instead by its
     neighbours: the donor line at the same line number, within 1.0 s,
@@ -1367,109 +1370,140 @@ def decensor_result(result: LyricsResult,
                 and not cand.is_censored and cand.has_synced]
     if not eligible:
         return None
-    # First pass: lines provable on their own (anchor words in the
-    # line itself). Record the best donor line per censored line,
-    # with its word alignment and the donor it came from — the donor
-    # may have a different word count, so substitutions follow the
-    # alignment, not the position.
-    # Each entry: (donor source, donor words, {winner_idx: donor_idx}).
-    best_lines: list[tuple[str, list[str], dict[int, int]] | None] = []
-    for line in result.synced_lines:
-        best: tuple[str, list[str], dict[int, int]] | None = None
-        best_dt = 1.0
-        for donor in eligible:
-            for dline in donor.synced_lines:
-                dt = abs(dline.time - line.time)
-                if dt > best_dt:
-                    continue
-                mapping = _align_lines(line, dline)
-                if mapping is not None:
-                    best = (donor.source, _donor_words(dline), mapping)
-                    best_dt = dt
-        if best is None:
-            # No single donor line aligns: the donor may have split
-            # this line in two (or three). Try merged runs of
-            # consecutive donor lines whose time span covers the
-            # winner line; the alignment is still the proof.
-            best_dist = None
-            for donor in eligible:
-                dlines = donor.synced_lines
-                for size in (2, 3):
-                    for start in range(len(dlines) - size + 1):
-                        run = dlines[start:start + size]
-                        span_start = run[0].time
-                        span_end = _line_end(dlines, start + size - 1)
-                        if line.time < span_start - 1.0:
-                            continue
-                        if line.time > span_end + 1.0:
-                            continue
-                        dist = 0.0
-                        if line.time < span_start:
-                            dist = span_start - line.time
-                        elif line.time > span_end:
-                            dist = line.time - span_end
-                        if best_dist is not None and dist >= best_dist:
-                            continue
-                        merged = LyricLine(
-                            run[0].time,
-                            " ".join(t.text for t in run))
-                        mapping = _align_lines(line, merged)
-                        if mapping is not None:
-                            best = (donor.source,
-                                    _donor_words(merged), mapping)
-                            best_dist = dist
-        best_lines.append(best)
-    # Second pass: lines of only asterisks, proven by neighbours.
-    # Any eligible donor may prove one — try them in pool order.
-    for i, line in enumerate(result.synced_lines):
-        if best_lines[i] is not None or not _is_all_censored(line):
-            continue
-        c_words = ([w.text for w in line.words] if line.words
-                   else line.text.split())
-        if not c_words:
-            continue
-        for donor in eligible:
-            if i >= len(donor.synced_lines):
-                continue
-            dline = donor.synced_lines[i]
-            if abs(dline.time - line.time) > 1.0:
-                continue
-            if len(c_words) != len(_donor_words(dline)):
-                continue
-            if _neighbour_anchored(result, donor, i):
-                # Same word count here, so the alignment is positional.
-                best_lines[i] = (donor.source, _donor_words(dline),
-                                 {k: k for k in range(len(c_words))})
-                break
+    # Collect verified replacements per word, preferring individual
+    # lines over merged runs, then the nearest timestamp and pool order.
+    # Fully masked words also need agreement from independent providers.
     fixed_lines: list[LyricLine] = []
     fixed_any = False
     fixed_by_source: dict[str, int] = {}
-    for line, best in zip(result.synced_lines, best_lines):
-        if best is None:
-            fixed_lines.append(line)
-            continue
-        donor_source, d_words, mapping = best
+
+    def provider(source):
+        source = source.removesuffix("-cache")
+        return "lrclib" if source in ("search", "cache", "lrclib") else source
+
+    for line_idx, line in enumerate(result.synced_lines):
         c_words = ([w.text for w in line.words] if line.words
                    else line.text.split())
-        new_text = line.text
+        proposals: dict[int, list[tuple[int, float, int, str, str, tuple[str, ...]]]] = {}
+        fully_masked = [i for i, word in enumerate(c_words)
+                        if (core := _split_punct(word)[1])
+                        and not core.strip("*")]
+
+        def add_candidate(donor, dline, priority, distance, donor_idx, mapping=None):
+            d_words = _donor_words(dline)
+            if mapping is None:
+                mapping = _align_lines(line, dline)
+            if mapping is None:
+                return
+            # Consensus must cover the entire masked phrase from each
+            # candidate, not a different pair of donors for each word.
+            masked_words = [_uncensored_word(c_words[i], d_words[mapping[i]])
+                            if i in mapping else None for i in fully_masked]
+            signature = tuple(w.casefold() for w in masked_words if w is not None)
+            all_masked = _is_all_censored(line)
+            for idx, d_idx in mapping.items():
+                c = c_words[idx]
+                fixed = _uncensored_word(c, d_words[d_idx])
+                if fixed is None or fixed == c:
+                    continue
+                core = _split_punct(c)[1]
+                if not core.strip("*") and len(signature) != len(fully_masked):
+                    continue
+                if not core.strip("*") and not all_masked:
+                    # Do not treat a single generic anchor as proof.
+                    anchors = [i for i, word in enumerate(c_words)
+                               if "*" not in _split_punct(word)[1]]
+                    if (len(anchors) < 2 or len(c_words) != len(d_words)
+                            or any(i not in mapping or
+                                   _split_punct(c_words[i])[1].lower() !=
+                                   _split_punct(d_words[mapping[i]])[1].lower()
+                                   for i in anchors)):
+                        continue
+                proposals.setdefault(idx, []).append(
+                    (priority, distance, donor_idx, fixed, donor.source, signature))
+
+        for donor_idx, donor in enumerate(eligible):
+            dlines = donor.synced_lines
+            for dline in dlines:
+                dt = abs(dline.time - line.time)
+                if dt <= 1.0:
+                    add_candidate(donor, dline, 0, dt, donor_idx)
+            for size in (2, 3):
+                for start in range(len(dlines) - size + 1):
+                    run = dlines[start:start + size]
+                    span_start = run[0].time
+                    span_end = _line_end(dlines, start + size - 1)
+                    if not span_start - 1.0 <= line.time <= span_end + 1.0:
+                        continue
+                    dist = max(span_start - line.time, line.time - span_end, 0.0)
+                    merged = LyricLine(run[0].time, " ".join(t.text for t in run))
+                    add_candidate(donor, merged, 1, dist, donor_idx)
+            if (_is_all_censored(line) and line_idx < len(dlines)
+                    and abs(dlines[line_idx].time - line.time) <= 1.0
+                    and len(c_words) == len(_donor_words(dlines[line_idx]))
+                    and _neighbour_anchored(result, donor, line_idx)):
+                add_candidate(donor, dlines[line_idx], 0,
+                              abs(dlines[line_idx].time - line.time), donor_idx,
+                              {k: k for k in range(len(c_words))})
+
+        chosen: dict[int, tuple[str, str]] = {}
+        for idx, candidates in proposals.items():
+            candidates.sort()
+            core = _split_punct(c_words[idx])[1]
+            for _, _, _, fixed, source, signature in candidates:
+                if not core.strip("*"):
+                    # Cache/network variants and LRCLIB search results are
+                    # the same provider, not independent confirmation.
+                    agreeing = {
+                        provider(other_source)
+                        for _, _, _, _, other_source, other_signature in candidates
+                        if other_signature == signature
+                    }
+                    if len(agreeing) < 2:
+                        continue
+                chosen[idx] = (fixed, source)
+                break
+        if not chosen:
+            fixed_lines.append(line)
+            continue
+
+        # Find each whole timed word in sequence, so a later short word
+        # can never replace a substring inside an earlier word.
+        spans = []
+        cursor = 0
+        for word in c_words:
+            match = re.search(r"(?<!\S)" + re.escape(word) + r"(?!\S)",
+                              line.text[cursor:])
+            if match is None:
+                spans = []
+                break
+            start, end = cursor + match.start(), cursor + match.end()
+            spans.append((start, end))
+            cursor = end
+        if not spans:
+            fixed_lines.append(line)
+            continue
+        pieces = []
         new_words: list[LyricWord] = []
-        for idx, c in enumerate(c_words):
-            d = d_words[mapping[idx]] if idx in mapping else None
-            fixed = _uncensored_word(c, d) if d is not None else None
-            if fixed is not None and fixed != c:
-                new_text = new_text.replace(c, fixed, 1)
+        cursor = 0
+        for idx, (word, (start, end)) in enumerate(zip(c_words, spans)):
+            fixed, source = chosen.get(idx, (word, ""))
+            pieces.extend((line.text[cursor:start], fixed))
+            cursor = end
+            if source:
                 fixed_any = True
-                fixed_by_source[donor_source] = \
-                    fixed_by_source.get(donor_source, 0) + 1
-            else:
-                fixed = c
+                fixed_by_source[source] = fixed_by_source.get(source, 0) + 1
             if line.words:
                 w = line.words[idx]
-                parts = ([LyricWord(w.time, w.end, fixed)]
-                         if w.parts else [])
-                new_words.append(LyricWord(w.time, w.end, fixed,
-                                           w.is_background, parts=parts))
-        fixed_lines.append(LyricLine(line.time, new_text, words=new_words))
+                if source:
+                    parts = ([LyricWord(w.time, w.end, fixed, w.is_background)]
+                             if w.parts else [])
+                    new_words.append(LyricWord(w.time, w.end, fixed,
+                                               w.is_background, parts=parts))
+                else:
+                    new_words.append(w)
+        pieces.append(line.text[cursor:])
+        fixed_lines.append(LyricLine(line.time, "".join(pieces), words=new_words))
     if not fixed_any:
         return None
     # The donor that supplied the most fixed words names the fix

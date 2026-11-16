@@ -699,7 +699,9 @@ def test_decensor_result():
                               album="DAMN.", duration=177.0,
                               synced_lines=[_line(30.1, "Bitch, sit down")],
                               source="search", raw_text="Bitch, sit down")
-    fixed_star = decensor_result(star_cens, [star_donor])
+    assert decensor_result(star_cens, [star_donor]) is None  # one donor is not proof
+    from dataclasses import replace
+    fixed_star = decensor_result(star_cens, [star_donor, replace(star_donor, source="amll")])
     assert fixed_star is not None
     assert fixed_star.synced_lines[0].text == "Bitch, sit down"
     assert fixed_star.synced_lines[0].words[0].time == 30.0  # timing kept
@@ -740,6 +742,66 @@ def test_decensor_dropped_g():
     print("  decensor dropped-g contraction: OK")
 
 
+def test_decensor_verified_replacements():
+    from dataclasses import replace
+    def result(source, text, time=10.0, words=None):
+        return LyricsResult(artist="A", track="T", source=source, raw_text=text,
+                            synced_lines=[LyricLine(time, text, words or [])])
+
+    winner = result("qq", "hello f**k")
+    bad = result("amll", "hello duck", 10.01)
+    good = result("search", "hello fuck", 10.2)
+    fixed = decensor_result(winner, [bad, good])
+    assert fixed and fixed.synced_lines[0].text == "hello fuck"
+    assert fixed.decensored_from == "search"
+
+    # One donor may fix one word while another fixes the other.
+    winner = result("qq", "hello f**k and s**t")
+    first = result("amll", "hello fuck and snow", 10.01)
+    second = result("search", "hello duck and shit", 10.2)
+    fixed = decensor_result(winner, [first, second])
+    assert fixed and fixed.synced_lines[0].text == "hello fuck and shit"
+
+    parts = [LyricWord(10, 10.4, "f**"), LyricWord(10.4, 11, "king")]
+    words = [LyricWord(10, 11, "f**king", parts=parts),
+             LyricWord(11, 12, "f**k"), LyricWord(12, 13, "today")]
+    winner = result("qq", "f**king f**k today", words=words)
+    donor = result("search", "working fuck today")
+    fixed = decensor_result(winner, [donor])
+    assert fixed and fixed.synced_lines[0].text == "f**king fuck today"
+    assert [w.text for w in fixed.synced_lines[0].words] == ["f**king", "fuck", "today"]
+    assert fixed.synced_lines[0].words[0].parts == parts
+    assert fixed.synced_lines[0].words[0].parts[1].time == 10.4
+    clean_parts = [LyricWord(10, 10.4, "hel"), LyricWord(10.4, 11, "lo")]
+    winner = result("qq", "hello f**k", words=[
+        LyricWord(10, 11, "hello", parts=clean_parts), LyricWord(11, 12, "f**k")])
+    fixed = decensor_result(winner, [good])
+    assert fixed and fixed.synced_lines[0].words[0].parts == clean_parts
+
+    # A generic anchor and a single donor cannot prove a fully masked word.
+    masked = result("qq", "hello ****")
+    assert decensor_result(masked, [result("search", "hello different")]) is None
+    anchored = result("qq", "please sit ****")
+    one = result("search", "please sit down")
+    assert decensor_result(anchored, [one]) is None
+    assert decensor_result(anchored, [one, replace(one, source="cache")]) is None
+    disagreement = result("amll", "please sit here")
+    assert decensor_result(anchored, [one, disagreement]) is None
+    agreed = result("amll", "please sit down")
+    fixed = decensor_result(anchored, [one, agreed])
+    assert fixed and fixed.synced_lines[0].text == "please sit down"
+    # Do not assemble a two-word phrase out of three disagreeing donors.
+    masked_pair = result("qq", "please sit **** ****")
+    first = result("search", "please sit red green")
+    second = result("amll", "please sit red blue")
+    third = result("unison", "please sit blue green")
+    assert decensor_result(masked_pair, [first, second, third]) is None
+    agreed_pair = replace(first, source="amll")
+    fixed = decensor_result(masked_pair, [first, agreed_pair])
+    assert fixed and fixed.synced_lines[0].text == "please sit red green"
+    print("  decensor verified replacements: OK")
+
+
 def test_decensor_full_asterisk_line_neighbours():
     """A line of only `****` is filled from the donor when its
     neighbours prove it is the same line — and left alone when
@@ -764,7 +826,9 @@ def test_decensor_full_asterisk_line_neighbours():
         _line(20.2, "fuck shit"),
         _line(30.1, "sit down please"),
     ], "fuck shit")
-    fixed = decensor_result(censored, [donor])
+    from dataclasses import replace
+    assert decensor_result(censored, [donor]) is None  # independent agreement required
+    fixed = decensor_result(censored, [donor, replace(donor, source="amll")])
     assert fixed is not None
     assert fixed.synced_lines[1].text == "fuck shit"
     assert fixed.synced_lines[1].words[0].text == "fuck"
@@ -782,7 +846,7 @@ def test_decensor_full_asterisk_line_neighbours():
         _line(5.1, "fuck"),
         _line(10.1, "hello world"),
     ], "fuck")
-    fixed_first = decensor_result(first, [first_donor])
+    fixed_first = decensor_result(first, [first_donor, replace(first_donor, source="amll")])
     assert fixed_first is not None
     assert fixed_first.synced_lines[0].text == "fuck"
     # A neighbour that contradicts the donor refuses the fill, even
@@ -798,7 +862,16 @@ def test_decensor_full_asterisk_line_neighbours():
         _line(20.1, "fuck shit"),
         _line(30.1, "something else"),
     ], "fuck shit")
-    assert decensor_result(contra, [contra_donor]) is None
+    assert decensor_result(contra, [contra_donor, replace(contra_donor, source="amll")]) is None
+    # One generic shared word in each neighbour is not sufficient when
+    # the rest of those lines contradict the donor.
+    weak = _res("qq", [
+        _line(1.0, "hello good morning"), _line(3.0, "****"),
+        _line(5.0, "farewell my friend")], "hello good morning **** farewell my friend")
+    weak_donor = _res("search", [
+        _line(1.0, "hello another world"), _line(3.0, "wrong"),
+        _line(5.0, "farewell strange enemy")], "hello another world wrong farewell strange enemy")
+    assert decensor_result(weak, [weak_donor, replace(weak_donor, source="amll")]) is None
     # A track that is all asterisks has no anchors anywhere: refused.
     all_cens = _res("qq", [
         _line(5.0, "**** ****"),
@@ -808,7 +881,7 @@ def test_decensor_full_asterisk_line_neighbours():
         _line(5.1, "fuck shit"),
         _line(10.1, "damn"),
     ], "fuck shit")
-    assert decensor_result(all_cens, [all_donor]) is None
+    assert decensor_result(all_cens, [all_donor, replace(all_donor, source="amll")]) is None
     # Same position and neighbours, but the donor line has a
     # different word count: refused.
     count = _res("qq", [
@@ -821,7 +894,7 @@ def test_decensor_full_asterisk_line_neighbours():
         _line(20.1, "fuck shit damn"),
         _line(30.1, "sit down please"),
     ], "fuck shit damn")
-    assert decensor_result(count, [count_donor]) is None
+    assert decensor_result(count, [count_donor, replace(count_donor, source="amll")]) is None
     print("  decensor full-asterisk line (neighbours): OK")
 
 
@@ -1250,6 +1323,7 @@ TESTS = [
     test_censored_word_match,
     test_decensor_result,
     test_decensor_dropped_g,
+    test_decensor_verified_replacements,
     test_decensor_full_asterisk_line_neighbours,
     test_decensor_line_variants,
     test_decensor_split_lines,

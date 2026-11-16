@@ -13,8 +13,9 @@ never loses sync. The engine owns:
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, SLOT
 
 import mpris
 from lyrics import (
@@ -30,48 +31,144 @@ from lyrics import (
 )
 
 
-class MonotonicPosition:
-    """Interpolated position that never goes backwards.
+@dataclass
+class _SeekCandidate:
+    """A run of reports that disagree with a freshly anchored seek.
 
-    Browsers (YouTube Music in Firefox/Chromium) report MPRIS Position
-    in 1 s steps, so the reported value stays flat for ~4 polls and then
-    jumps a whole second. Naively resetting the interpolation anchor to
-    each report makes the estimate sawtooth back to the floored value
-    on every poll — and if a line boundary falls inside that window,
-    line_at() flips between two lines on every poll and the scroll
-    animation gets retargeted up and down forever.
-
-    Instead, keep an anchor (position + monotonic time it was set) and
-    interpolate from it while Playing. A new report is adopted as the
-    anchor when it is ahead of the estimate minus a small tolerance
-    (normal advance / jitter), or when it is far away either way
-    (a real seek). A report behind the estimate by more than the
-    tolerance is a stale/floored report and is ignored, so the estimate
-    never goes backwards.
+    MPRIS positions carry no sample time, so one odd value may simply be
+    stale. A run that keeps moving consistently is evidence — never proof —
+    of a real external seek; `MonotonicPosition` adopts it only once it has
+    lasted `AMBIGUOUS_SECONDS` without a longer gap.
     """
 
-    STALE_TOLERANCE = 0.5  # s: ignore reports this far behind the estimate
-    SEEK_JUMP = 2.0        # s: a jump this big either way is a real seek
+    start: float
+    since: float
+    progress: float = 0.0
+    last_seen: float = 0.0
+
+    def observe(self, reported: float, now: float, elapsed: float, *,
+                gap: float, tolerance: float, jump: float) -> bool:
+        """Fold in `reported`; False means it starts a new run instead."""
+        progress = self.progress + elapsed
+        if (now - self.last_seen > gap
+                or not self.start - tolerance <= reported <= self.start + progress + jump):
+            return False
+        self.progress = progress
+        self.last_seen = now
+        return True
+
+
+class MonotonicPosition:
+    """Interpolate between reports without rewinding on floored positions.
+
+    A backward jump in the reported position identifies an external seek;
+    repeated or slightly jittery reports must not reset the running clock.
+    """
+
+    # Timing windows for position reconciliation, all in seconds.
+    SEEK_JUMP = 2.0             # forward report jump that counts as a seek
+    BACKWARD_JUMP = 0.5         # backward report jump that counts as a seek
+    REPORT_TOLERANCE = 1.25     # floored report plus one polling interval
+    AMBIGUOUS_SECONDS = 3.0     # a conflicting run must last this long...
+    MAX_REPORT_GAP = 1.5        # ...without a longer silence restarting it
+    MAX_PROTECT_SECONDS = 10.0  # never shield a seek longer than this
 
     def __init__(self):
         self.anchor = 0.0
         self.anchor_time: float | None = None
+        self.playing = False
+        self.last_report: float | None = None
+        self.discontinuity = False
+        self.protect_until: float | None = None  # set while a seek settles
+        self.candidate: _SeekCandidate | None = None
+        self.resync: str | None = None  # "conflict" | "timeout" after observe()
 
     def estimate(self, now: float, playing: bool = True) -> float:
-        if self.anchor_time is None or not playing:
+        if self.anchor_time is None or not playing or not self.playing:
             return self.anchor
-        return self.anchor + (now - self.anchor_time)
+        return self.anchor + max(0.0, now - self.anchor_time)
+
+    def _agrees(self, est: float, reported: float) -> bool:
+        """True when a report confirms the anchored seek."""
+        return est - self.REPORT_TOLERANCE <= reported <= est + self.SEEK_JUMP
+
+    def _jumped(self, est: float, reported: float) -> bool:
+        """True when a report is far enough off to be an external seek."""
+        backward = (self.last_report is not None
+                    and reported < self.last_report - self.BACKWARD_JUMP)
+        return backward or reported > est + self.SEEK_JUMP
+
+    def _release_protection(self, now: float) -> None:
+        """Stop shielding a seek whose confirmation never settles."""
+        if self.protect_until is not None and now >= self.protect_until:
+            self.protect_until = None
+            self.candidate = None
+            self.resync = "timeout"
+
+    def _adopt(self, reported: float) -> None:
+        """Follow the player from `reported`; the anchor moves backwards."""
+        self.anchor = reported
+        self.discontinuity = True
+        self.candidate = None
+
+    def _conflict_confirmed(self, reported: float, now: float) -> bool:
+        """True once a conflicting run has outlasted a lone stale sample."""
+        elapsed = max(0.0, now - self.anchor_time) if self.playing else 0.0
+        candidate = self.candidate
+        if candidate is None or not candidate.observe(
+                reported, now, elapsed, gap=self.MAX_REPORT_GAP,
+                tolerance=self.REPORT_TOLERANCE, jump=self.SEEK_JUMP):
+            self.candidate = _SeekCandidate(reported, now, last_seen=now)
+            return False
+        return now - candidate.since >= self.AMBIGUOUS_SECONDS
 
     def observe(self, reported: float, now: float, playing: bool = True) -> float:
-        est = self.estimate(now, playing)
-        if reported >= est - self.STALE_TOLERANCE or abs(reported - est) > self.SEEK_JUMP:
-            self.anchor = float(reported)
-            self.anchor_time = now
-        return self.estimate(now, playing)
-
-    def set(self, position: float, now: float) -> None:
-        self.anchor = float(position)
+        reported = max(0.0, float(reported))
+        self.discontinuity = False
+        self.resync = None
+        if self.anchor_time is None:
+            self.anchor = reported
+        else:
+            est = self.estimate(now, self.playing)
+            self._release_protection(now)
+            if self.protect_until is not None and self._agrees(est, reported):
+                # Target confirmed, possibly floored: never rewind it.
+                self.anchor = max(est, reported)
+                self.candidate = None
+            elif self.protect_until is not None:
+                # Isolated stale samples are ignored; a sustained conflicting
+                # run is the best available evidence of an external seek.
+                if not self._conflict_confirmed(reported, now):
+                    self.anchor = est
+                    self.anchor_time = now
+                    self.playing = playing
+                    return self.anchor
+                self._adopt(reported)
+                self.resync = "conflict"
+            elif self._jumped(est, reported):
+                self._adopt(reported)
+            else:
+                self.anchor = max(est, reported)
+                self.candidate = None
         self.anchor_time = now
+        self.playing = playing
+        self.last_report = reported
+        return self.anchor
+
+    def set(self, position: float, now: float, playing: bool = True) -> None:
+        self.anchor = max(0.0, float(position))
+        self.anchor_time = now
+        self.playing = playing
+        self.last_report = self.anchor
+        self.discontinuity = True
+        self.protect_until = None
+        self.candidate = None
+        self.resync = None
+
+    def seek(self, position: float, now: float, playing: bool = True) -> None:
+        """Anchor a local or signalled seek; reconcile later position polls."""
+        self.set(position, now, playing)
+        self.protect_until = now + self.MAX_PROTECT_SECONDS
 
 
 def _provider_name(source: str) -> str:
@@ -151,6 +248,13 @@ class PlaybackEngine(QObject):
     players_changed = Signal(list)      # list[str]
 
     POLL_MS = 250
+    _MPRIS_PATH = "/org/mpris/MediaPlayer2"
+    _MPRIS_INTERFACE = "org.mpris.MediaPlayer2.Player"
+    _SEEK_SLOT = SLOT("_on_mpris_seeked(qlonglong)")
+    # Seeked carries no request ID, so a pending local target can only be
+    # matched by position. Keep the window short: past it, the event is
+    # treated as genuine rather than swallowed as a delayed acknowledgement.
+    _SEEK_ACK_SECONDS = 3.0
 
     def __init__(self, demo: bool = False, parent=None):
         super().__init__(parent)
@@ -168,6 +272,14 @@ class PlaybackEngine(QObject):
         self._fetch_key: tuple | None = None
         self._search_key: tuple | None = None
         self._players: list[str] = []
+        self._seek_bus = None
+        self._seek_service = ""
+        # Unmatched local acknowledgements are bounded because Seeked does
+        # not include a request ID, and some players never emit it.
+        self._local_seek_targets: list[tuple[float, float]] = []
+        self._seek_in_flight = False
+        self._seek_events_during_command: list[int] = []
+        self._ambiguous_notice = False
         # Lyrics preferences (provider order / enabled / word-only),
         # from the app config via set_lyrics_prefs. Defaults match
         # the registry until the controller hands over the real ones.
@@ -203,13 +315,16 @@ class PlaybackEngine(QObject):
     def stop(self):
         self._timer.stop()
         self._players_timer.stop()
+        self._subscribe_seek_events("")
         self._worker_thread.quit()
         self._worker_thread.wait(2000)
 
     def set_player(self, player: str):
         if player != self.player:
             self.player = player
+            self._subscribe_seek_events(player)
             self.track = mpris.TrackInfo(player=player)
+            self._pos = MonotonicPosition()
             self.lyrics = None
             self._fetch_key = None
             self._emit_floor = None
@@ -240,6 +355,62 @@ class PlaybackEngine(QObject):
             self._fetch_lyrics(self.track)
 
     # -------------------------------------------------------------- polling
+    def _subscribe_seek_events(self, player: str):
+        service = f"org.mpris.MediaPlayer2.{player}" if player else ""
+        if service == self._seek_service:
+            return
+        if self._seek_bus is not None:
+            self._seek_bus.disconnect(self._seek_service, self._MPRIS_PATH,
+                                      self._MPRIS_INTERFACE, "Seeked", self,
+                                      self._SEEK_SLOT)
+        self._seek_bus = None
+        self._seek_service = ""
+        self._forget_seek_acks()
+        if not service:
+            return
+        try:
+            from PySide6.QtDBus import QDBusConnection
+            bus = QDBusConnection.sessionBus()
+            if bus.isConnected() and bus.connect(
+                    service, self._MPRIS_PATH, self._MPRIS_INTERFACE,
+                    "Seeked", self, self._SEEK_SLOT):
+                self._seek_bus = bus
+                self._seek_service = service
+        except (ImportError, RuntimeError):
+            pass  # position-only reconciliation also supports playerctl
+
+    def _forget_seek_acks(self) -> None:
+        """Drop pending acknowledgements and any uncertainty notice."""
+        self._local_seek_targets.clear()
+        self._ambiguous_notice = False
+
+    def _prune_seek_acks(self, now: float) -> None:
+        self._local_seek_targets = [
+            (target, at) for target, at in self._local_seek_targets
+            if now - at <= self._SEEK_ACK_SECONDS]
+
+    @Slot("qlonglong")
+    def _on_mpris_seeked(self, position_us: int):
+        if (self.demo or not self.player or self.track.player != self.player or
+                self._seek_service != f"org.mpris.MediaPlayer2.{self.player}"):
+            return
+        if self._seek_in_flight:
+            self._seek_events_during_command.append(position_us)
+            return
+        now = time.monotonic()
+        position = max(0.0, position_us / 1_000_000)
+        self._prune_seek_acks(now)
+        for i, (target, _at) in enumerate(self._local_seek_targets):
+            if abs(position - target) <= self._pos.REPORT_TOLERANCE:
+                # Even the latest acknowledgement may have been queued for
+                # seconds: the optimistic anchor is already more current.
+                del self._local_seek_targets[i]
+                return
+        self._forget_seek_acks()
+        self._pos.seek(position, now, self.track.status == "Playing")
+        self._emit_floor = None
+        self._emit_position()
+
     def _refresh_players(self):
         if self.demo:
             return
@@ -251,6 +422,7 @@ class PlaybackEngine(QObject):
                 self.player = players[0]
             elif self.player and self.player not in players:
                 self.player = players[0] if players else ""
+        self._subscribe_seek_events(self.player)
 
     def _load_demo(self):
         from lyrics import DEMO_ALBUM, DEMO_ARTIST, DEMO_DURATION, DEMO_TRACK
@@ -286,14 +458,35 @@ class PlaybackEngine(QObject):
             if not self.player:
                 self.status_changed.emit("No MPRIS player found — start Spotify or YouTube Music")
                 return
+        self._subscribe_seek_events(self.player)
         track = mpris.get_track(self.player)
         if track is None:
             self.status_changed.emit(f"Player '{self.player}' stopped responding")
             return
-        # Monotonic anchor: a floored browser report must not drag the
-        # interpolated estimate backwards (see MonotonicPosition).
-        self._pos.observe(track.position, now, playing=(track.status == "Playing"))
         changed = track.key != self.track.key
+        playing = track.status == "Playing"
+        if changed or track.player != self.track.player:
+            self._local_seek_targets.clear()
+            self._ambiguous_notice = False
+            self._pos.set(track.position, now, playing)
+            self._emit_floor = None
+        else:
+            self._pos.observe(track.position, now, playing)
+            if self._pos.discontinuity:
+                self._emit_floor = None
+            if self._pos.candidate is not None and not self._ambiguous_notice:
+                self._ambiguous_notice = True
+                self.status_changed.emit("Playback position uncertain — waiting for consistent MPRIS reports or a seek event")
+            if self._pos.resync == "timeout":
+                self._forget_seek_acks()
+                self.status_changed.emit(
+                    "Seek not confirmed — position resynchronized to the player")
+            if self._pos.resync == "conflict":
+                self._forget_seek_acks()
+                self.status_changed.emit("Playback position resynchronized from ambiguous MPRIS reports")
+            elif self._pos.candidate is None and self._ambiguous_notice:
+                self._ambiguous_notice = False
+                self.status_changed.emit("Playback position reports agree again")
         self.track = track
         if changed:
             self.track_changed.emit(track)
@@ -536,10 +729,26 @@ class PlaybackEngine(QObject):
             self._emit_position()
             return
         if self.player:
-            mpris.seek(self.player, seconds)
-            self._pos.set(seconds, time.monotonic())
-            self._emit_floor = None  # a seek may legitimately go backwards
-            self._emit_position()
+            self._subscribe_seek_events(self.player)
+            target = max(0.0, float(seconds))
+            # QtDBus may dispatch Seeked reentrantly during a blocking call.
+            self._seek_in_flight = True
+            try:
+                success = mpris.seek(self.player, target)
+            finally:
+                self._seek_in_flight = False
+            if success:
+                now = time.monotonic()
+                if self._seek_bus is not None:
+                    self._prune_seek_acks(now)
+                    self._local_seek_targets.append((target, now))
+                self._ambiguous_notice = False
+                self._pos.seek(target, now, playing=(self.track.status == "Playing"))
+                self._emit_floor = None
+                self._emit_position()
+            events, self._seek_events_during_command = self._seek_events_during_command, []
+            for event in events:
+                self._on_mpris_seeked(event)
 
     @property
     def current_line_index(self) -> int:
