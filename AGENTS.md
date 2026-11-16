@@ -478,11 +478,17 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   exits 0. (Fontconfig may log one harmless "Cannot load default config
   file" warning; unpacking `fonts-dejavu-core` plus a `fonts.conf` silences
   it but is not needed for a clean exit.)
-  `main()` ends with `_teardown_qt()`: Qt objects must not outlive their
-  QApplication, or PySide6 crashes during interpreter shutdown — a random
-  SIGSEGV, and a reproducible SIGBUS after the `PreferencesDialog` tests.
-  The helper closes and deletes the tests' top-level windows, pumps the
-  event loop, then drops the app, so the exit code is CI-trustworthy.
+  `main()` runs the tests via `_run_suite(app)` and tears down in a
+  `finally` with `_teardown_qt()`: that closes and deletes the tests'
+  top-level windows, pumps the event loop, then destroys the QApplication
+  itself (`deleteLater` + DeferredDelete, so `QCoreApplication.instance()`
+  is None afterwards). Qt objects must not outlive the application or
+  PySide6 crashes during interpreter shutdown — a random SIGSEGV, and a
+  reproducible SIGBUS after the `PreferencesDialog` tests. `main()` still
+  holds its own `app` reference, so deleting the name inside the helper
+  would release nothing. A failing test exits 1, not 139, so the exit code
+  is CI-trustworthy: `.github/workflows/tests.yml` runs this suite offscreen
+  under `dbus-run-session` on PRs and pushes to main.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo

@@ -29,7 +29,9 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import QEventLoop, QLockFile, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import (  # noqa: E402
+    QCoreApplication, QEvent, QEventLoop, QLockFile, Qt, QTimer,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
@@ -1279,25 +1281,25 @@ def test_demo_word_highlight(app):
 
 
 def _teardown_qt(app):
-    """Destroy the tests' widgets, then the QApplication, in that order.
+    """Destroy the tests' widgets and then the QApplication itself.
 
-    Qt must not outlive its application: if the interpreter destroys
-    leftover windows after QApplication is gone (main()'s local goes out
-    of scope at return), PySide6 crashes during shutdown — intermittently
-    SIGSEGV, and reproducibly SIGBUS after the PreferencesDialog tests.
-    Closing and deleting the top-level widgets first makes the full suite
-    exit 0, which CI can trust.
+    Qt objects must not outlive their application: PySide6 then crashes
+    during interpreter shutdown — a random SIGSEGV, and a reproducible
+    SIGBUS after the PreferencesDialog tests. `main()` holds its own
+    reference to `app`, so dropping the reference here would do nothing;
+    the application is destroyed explicitly instead, which is also why
+    `QCoreApplication.instance()` is None once this returns.
     """
     app.closeAllWindows()
     for widget in app.topLevelWidgets():
         widget.deleteLater()
     app.processEvents()
-    del app
+    app.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     gc.collect()
 
 
-def main():
-    app = QApplication(sys.argv)
+def _run_suite(app):
     test_build_display_menu(app)
     test_lerp_color()
     test_smooth_scroller(app)
@@ -1327,7 +1329,14 @@ def main():
     test_seek_reconciliation_caps(app)
     test_mpris_seeked_subscription(app)
     test_demo_word_highlight(app)
-    _teardown_qt(app)
+
+
+def main():
+    app = QApplication(sys.argv)
+    try:
+        _run_suite(app)
+    finally:
+        _teardown_qt(app)
     print("test_ui_smoke: OK — all checks passed")
     return 0
 
