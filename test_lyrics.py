@@ -3,12 +3,15 @@
 Run:  python3 test_lyrics.py
   or: python3 -m pytest test_lyrics.py -v        (pytest optional)
 
-The live LRCLIB test is skipped gracefully when offline: it never fails
-the suite for lack of network, it prints SKIP instead.
+The live `test_live_*` checks hit real provider APIs and skip gracefully when
+the network is unreachable: they never fail the suite for lack of network,
+they print SKIP instead. Set LYRICS_LIVE_TESTS=0 to skip them unconditionally
+(CI does: a provider outage must not turn into a red build).
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import urllib.error
@@ -1356,9 +1359,17 @@ TESTS = [
 ]
 
 
+LIVE_TESTS_ENV = "LYRICS_LIVE_TESTS"
+
+
 def main() -> int:
+    live_off = os.environ.get(LIVE_TESTS_ENV, "1") == "0"
     passed = skipped = failed = 0
     for test in TESTS:
+        if live_off and test.__name__.startswith("test_live_"):
+            skipped += 1
+            print(f"SKIP {test.__name__} (network)")
+            continue
         try:
             outcome = test()
             if outcome == "skip":

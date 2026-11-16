@@ -460,7 +460,8 @@ no login, no API keys.
 
 ```bash
 python3 -m py_compile synced_lyrics.py koneko_lyrics.py lyrics.py mpris.py playback.py test_lyrics.py test_ui_smoke.py
-python3 test_lyrics.py            # LRC/TTML parse + live Better Lyrics + live LRCLIB (live tests SKIP when offline or uncached, never fail for no network)
+python3 test_lyrics.py            # LRC/TTML parse + live provider checks (test_live_* SKIP when offline or uncached, never fail for no network)
+LYRICS_LIVE_TESTS=0 python3 test_lyrics.py   # skip every test_live_* check (what CI runs: no provider outage can fail the build)
 QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # animation helpers, render_line_html, MonotonicPosition, single-instance lock + local server, demo word highlight
   (Test venv lives at `~/.local/lyrics-venv` — NOT /tmp: /tmp is a
   512M tmpfs and a fresh PySide6 install does not fit, and /tmp is
@@ -487,8 +488,9 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   reproducible SIGBUS after the `PreferencesDialog` tests. `main()` still
   holds its own `app` reference, so deleting the name inside the helper
   would release nothing. A failing test exits 1, not 139, so the exit code
-  is CI-trustworthy: `.github/workflows/tests.yml` runs this suite offscreen
-  under `dbus-run-session` on PRs and pushes to main.
+  is CI-trustworthy: `.github/workflows/tests.yml` runs `test_lyrics.py`
+  with `LYRICS_LIVE_TESTS=0` plus this suite offscreen under
+  `dbus-run-session` on PRs and pushes to main.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo

@@ -39,6 +39,14 @@ jobs:
           python -m py_compile synced_lyrics.py koneko_lyrics.py lyrics.py \
             mpris.py playback.py test_lyrics.py test_ui_smoke.py
 
+      # Parser/decoder suite. The test_live_* checks call real provider APIs,
+      # so they are switched off: a provider outage or rate limit must not
+      # turn into a flaky red build.
+      - name: Lyrics parser suite (live network checks off)
+        env:
+          LYRICS_LIVE_TESTS: "0"
+        run: python test_lyrics.py
+
       # The suite's exit code is the assertion: it must exit 0. The app is
       # shown offscreen with no player, network or tray involved; the MPRIS
       # Seeked test skips itself when the session bus is unavailable.
