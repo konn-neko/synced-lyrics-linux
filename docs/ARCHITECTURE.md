@@ -38,7 +38,11 @@ Repo: https://github.com/konn-neko/synced-lyrics-linux
 │              │      │  reorder / disable / require │
 │              │      │  word sync in Preferences    │
 │              │      │  (File > Preferences…,       │
-│              │      │  Ctrl+,); cache in           │
+│              │      │  Ctrl+,); word sync always   │
+│              │      │  preferred over order;       │
+│              │      │  censored words swapped from │
+│              │      │  an uncensored copy (same    │
+│              │      │  timings); cache in           │
 │              │      │  ~/.cache/…                  │
 └──────────────┘      └──────────────────────────────┘
        │
