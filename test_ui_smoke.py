@@ -664,6 +664,7 @@ def test_preferences_dialog(app):
             if item.data(Qt.UserRole) == "kugou":
                 item.setCheckState(Qt.Unchecked)
         dlg.word_only_box.setChecked(True)
+        dlg.decensor_box.setChecked(False)
         dlg.offset_spin.setValue(1.5)
         dlg.font_spin.setValue(20)
         dlg.anim_box.setChecked(False)
@@ -675,6 +676,7 @@ def test_preferences_dialog(app):
         assert dlg.new_cfg["provider_enabled"]["kugou"] is False
         assert dlg.new_cfg["provider_enabled"]["lrclib"] is True
         assert dlg.new_cfg["word_only"] is True
+        assert dlg.new_cfg["decensor"] is False
         assert dlg.new_cfg["offset"] == 1.5
         assert dlg.new_cfg["font_size"] == 20
         assert dlg.new_cfg["line_animations"] is False
@@ -722,6 +724,39 @@ def test_preferences_dialog(app):
     print("  preferences dialog: OK (order/disable/word-only/offset/font/start/cancel/cache clear)")
 
 
+def test_preferences_dialog_layout(app):
+    """The Preferences dialog must not squash: the sources list keeps
+    its height, long labels wrap, the launch combo shows its value,
+    and shrinking the window scrolls the content instead of
+    compressing it (the reported bug: the list crushed to one row)."""
+    from PySide6.QtWidgets import QScrollArea
+    from synced_lyrics import PreferencesDialog
+
+    dlg = PreferencesDialog(None, dict(DEFAULT_CONFIG))
+    try:
+        dlg.show()
+        _pump(app, 200)
+        assert dlg.provider_list.count() == 7
+        assert dlg.provider_list.height() >= 200, (
+            f"sources list squashed to {dlg.provider_list.height()}px")
+        assert dlg.sources_desc_label.wordWrap(), "description must wrap"
+        assert dlg.start_combo.currentText() == "Full App", (
+            f"launch combo shows {dlg.start_combo.currentText()!r}")
+        assert dlg.display_combo.currentText() == "Primary display"
+        scroll = dlg.findChild(QScrollArea)
+        assert scroll is not None, "content must live in a scroll area"
+        # Shrink the dialog hard: the list must NOT shrink with it —
+        # the scroll area takes the overflow instead.
+        dlg.resize(560, 480)
+        _pump(app, 200)
+        assert dlg.provider_list.height() >= 200, (
+            f"sources list squashed to {dlg.provider_list.height()}px "
+            f"at 560x480")
+    finally:
+        dlg.close()
+    print("  preferences dialog layout: OK (list keeps height, labels wrap, scrolls)")
+
+
 def test_engine_lyrics_prefs(app):
     """Engine set_lyrics_prefs: normalises, stores, hands to the worker."""
     engine = PlaybackEngine(demo=True)
@@ -733,9 +768,13 @@ def test_engine_lyrics_prefs(app):
         assert engine.provider_enabled["lrclib"] is False
         assert engine.word_only is True
         assert engine._worker.lyrics_prefs[2] is True
-        engine.set_lyrics_prefs(None, None, False)
+        assert engine.decensor is True  # default on
+        assert engine._worker.lyrics_prefs[3] is True
+        engine.set_lyrics_prefs(None, None, False, decensor=False)
         assert engine.provider_order[0] == "betterlyrics"
         assert engine.word_only is False
+        assert engine.decensor is False
+        assert engine._worker.lyrics_prefs[3] is False
     finally:
         engine.stop()
     print("  engine lyrics prefs: OK (normalise + worker handoff)")
@@ -834,6 +873,7 @@ def main():
     test_choose_lyrics_dialog(app)
     test_engine_refetch_ignores_cache(app)
     test_preferences_dialog(app)
+    test_preferences_dialog_layout(app)
     test_engine_lyrics_prefs(app)
     test_engine_clears_lyrics_on_new_track(app)
     test_lyrics_debug_text(app)

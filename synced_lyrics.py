@@ -37,11 +37,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QGraphicsOpacityEffect,
-    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSizeGrip, QSlider,
-    QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
-    QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget, QWidgetAction,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QGraphicsOpacityEffect, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QScrollArea, QSizeGrip, QSizePolicy, QSlider, QSpinBox, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QSystemTrayIcon, QTextEdit,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 import mpris
@@ -86,6 +87,9 @@ DEFAULT_CONFIG = {
     "provider_enabled": {k: True for k in DEFAULT_PROVIDER_ORDER},
     # Only accept word-synced lyrics; skip line-only results entirely.
     "word_only": False,
+    # Swap asterisked words from an uncensored copy of the same track
+    # (another provider), keeping the original timings.
+    "decensor": True,
     # Which window to open at launch ("full" | "overlay"); --mode wins.
     "start_mode": "full",
 }
@@ -889,7 +893,8 @@ def _candidate_label(result) -> str:
     dur = fmt_time(result.duration) if result.duration else "??:??"
     album = f"  •  {result.album}" if result.album else ""
     censored = "  •  censored" if result.is_censored else ""
-    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}{censored}  •  {provider}"
+    decensored = "  •  de-censored" if result.decensored else ""
+    return (f"{result.artist} — {result.track}{album}  •  {dur}  •  {flags}{censored}{decensored}  •  {provider}"
             + (f"  •  LRCLIB #{result.lrclib_id}" if result.lrclib_id else ""))
 
 
@@ -972,7 +977,13 @@ class PreferencesDialog(QDialog):
     def __init__(self, parent, cfg: dict):
         super().__init__(parent)
         self.setWindowTitle("Preferences — synced-lyrics-linux")
-        self.setMinimumSize(580, 600)
+        # The content is taller than a small screen, so it lives in a
+        # scroll area: the dialog keeps a fixed, comfortable size and
+        # SCROLLS instead of squashing the widgets (the sources list
+        # was crushed to one row on a smaller display because the
+        # plain layout had nowhere to go). The OK/Cancel bar stays
+        # outside the scroll area, always visible.
+        self.setMinimumSize(560, 480)
         self.cfg = dict(cfg)
         order, enabled = normalise_provider_prefs(
             self.cfg.get("provider_order"), self.cfg.get("provider_enabled"))
@@ -981,16 +992,28 @@ class PreferencesDialog(QDialog):
         self.new_cfg: dict | None = None
 
         layout = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
 
         # --- Lyrics sources: order + on/off -------------------------
         src_group = QGroupBox("Lyrics sources")
         src_layout = QVBoxLayout(src_group)
-        src_layout.addWidget(QLabel(
+        desc_label = QLabel(
             "Tried in order, top first. Unchecked providers are skipped "
-            "entirely — for auto-fetch and for Choose lyrics."))
+            "entirely — for auto-fetch and for Choose lyrics.")
+        desc_label.setWordWrap(True)  # never run off the dialog edge
+        self.sources_desc_label = desc_label
+        src_layout.addWidget(desc_label)
         row = QHBoxLayout()
         self.provider_list = QListWidget(self)
-        self.provider_list.setMinimumHeight(180)
+        self.provider_list.setMinimumHeight(200)
+        self.provider_list.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
         for key, label, blurb in PROVIDERS:
             item = QListWidgetItem(f"{label} — {blurb}")
             item.setData(Qt.UserRole, key)
@@ -1012,7 +1035,7 @@ class PreferencesDialog(QDialog):
         btns.addWidget(self.defaults_btn)
         row.addLayout(btns)
         src_layout.addLayout(row)
-        layout.addWidget(src_group)
+        content_layout.addWidget(src_group)
 
         # --- Sync ----------------------------------------------------
         sync_group = QGroupBox("Sync")
@@ -1024,6 +1047,16 @@ class PreferencesDialog(QDialog):
             "When on, a track with only line-synced lyrics shows "
             "\"No word-synced lyrics found\" instead of the line sync.")
         sync_layout.addWidget(self.word_only_box)
+        self.decensor_box = QCheckBox(
+            "De-censor lyrics using other sources")
+        self.decensor_box.setChecked(bool(self.cfg.get("decensor", True)))
+        self.decensor_box.setToolTip(
+            "When the lyrics from one provider are asterisked "
+            "(f**k, b**ch), the app checks the other providers' copies "
+            "of the same song and swaps in the full words — keeping "
+            "the original timings. Only words it can verify "
+            "letter-for-letter are swapped.")
+        sync_layout.addWidget(self.decensor_box)
         off_row = QHBoxLayout()
         off_row.addWidget(QLabel("Sync offset:"))
         self.offset_spin = QDoubleSpinBox(self)
@@ -1035,7 +1068,7 @@ class PreferencesDialog(QDialog):
         off_row.addWidget(QLabel("Shift lyrics earlier (−) or later (+)"))
         off_row.addStretch(1)
         sync_layout.addLayout(off_row)
-        layout.addWidget(sync_group)
+        content_layout.addWidget(sync_group)
 
         # --- Appearance ----------------------------------------------
         app_group = QGroupBox("Appearance")
@@ -1062,7 +1095,7 @@ class PreferencesDialog(QDialog):
         start_row.addWidget(self.start_combo)
         start_row.addStretch(1)
         app_layout.addLayout(start_row)
-        layout.addWidget(app_group)
+        content_layout.addWidget(app_group)
 
         # --- Overlay ---------------------------------------------------
         ov_group = QGroupBox("Overlay")
@@ -1084,7 +1117,7 @@ class PreferencesDialog(QDialog):
         self.click_through_box.setChecked(
             bool(self.cfg.get("overlay_click_through", False)))
         ov_layout.addWidget(self.click_through_box)
-        layout.addWidget(ov_group)
+        content_layout.addWidget(ov_group)
 
         # --- Behaviour ---------------------------------------------------
         beh_group = QGroupBox("Behaviour")
@@ -1099,26 +1132,30 @@ class PreferencesDialog(QDialog):
         disp_row.addWidget(self.display_combo)
         disp_row.addStretch(1)
         beh_layout.addLayout(disp_row)
-        layout.addWidget(beh_group)
+        content_layout.addWidget(beh_group)
 
         # --- Lyrics cache ------------------------------------------------
         cache_group = QGroupBox("Lyrics cache")
         cache_layout = QVBoxLayout(cache_group)
         self.cache_label = QLabel()
+        self.cache_label.setWordWrap(True)  # long cache path, never clip
         cache_layout.addWidget(self.cache_label)
         self._refresh_cache_label()
         clear_btn = QPushButton("Clear lyrics cache")
         clear_btn.setToolTip("Delete all cached lyrics (album art is kept)")
         clear_btn.clicked.connect(self._clear_cache)
         cache_layout.addWidget(clear_btn)
-        layout.addWidget(cache_group)
+        content_layout.addWidget(cache_group)
 
-        layout.addStretch(1)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, stretch=1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.resize(640, 720)
 
     def _refresh_opacity_label(self):
         self.opacity_label.setText(f"{self.opacity_slider.value()}%")
@@ -1197,6 +1234,7 @@ class PreferencesDialog(QDialog):
         self.cfg["provider_order"] = order
         self.cfg["provider_enabled"] = enabled
         self.cfg["word_only"] = bool(self.word_only_box.isChecked())
+        self.cfg["decensor"] = bool(self.decensor_box.isChecked())
         self.cfg["offset"] = float(self.offset_spin.value())
         self.cfg["font_size"] = int(self.font_spin.value())
         self.cfg["line_animations"] = bool(self.anim_box.isChecked())
@@ -2101,7 +2139,8 @@ class AppController:
         self.engine.set_lyrics_prefs(
             self.cfg.get("provider_order"),
             self.cfg.get("provider_enabled"),
-            bool(self.cfg.get("word_only", False)))
+            bool(self.cfg.get("word_only", False)),
+            bool(self.cfg.get("decensor", True)))
         if self.cfg.get("last_player"):
             self.engine.set_player(self.cfg["last_player"])
 
@@ -2269,7 +2308,8 @@ class AppController:
         self.engine.set_lyrics_prefs(
             self.cfg.get("provider_order"),
             self.cfg.get("provider_enabled"),
-            bool(self.cfg.get("word_only", False)))
+            bool(self.cfg.get("word_only", False)),
+            bool(self.cfg.get("decensor", True)))
         self.full._apply_style()
         self.full._refresh_offset_label()
         idx = self.full._current_idx

@@ -206,6 +206,11 @@ class LyricsResult:
     # syncedLyrics keeps its Enhanced-LRC word tags, which a rebuild
     # from parsed lines would lose.
     raw_record: dict | None = None
+    # Set by decensor_result(): asterisked words were replaced from
+    # an uncensored copy of the same track (see below). Timings are
+    # still this result's own — only word text changed.
+    decensored: bool = False
+    decensored_from: str = ""  # donor provider source, e.g. "search"
 
     @property
     def has_synced(self) -> bool:
@@ -218,10 +223,15 @@ class LyricsResult:
 
     @property
     def is_censored(self) -> bool:
-        """True when the raw lyrics text carries asterisk-censored
-        words (see `is_censored_text`). Checked against `raw_text`,
-        which every provider sets — so it works for TTML, QRC, LRC
-        and LRCLIB records alike."""
+        """True when the displayed lyrics carry asterisk-censored
+        words (see `is_censored_text`). Normally checked against
+        `raw_text`, which every provider sets. After de-censoring,
+        the displayed text is the fixed lines, so those are checked
+        instead — a fully fixed result reports uncensored, a
+        partially fixed one still reports censored."""
+        if self.decensored:
+            return is_censored_text(
+                " ".join(line.text for line in self.synced_lines))
         return is_censored_text(self.raw_text or "")
 
     def line_at(self, position: float, offset: float = 0.0) -> int:
@@ -1135,6 +1145,166 @@ def _fetcher_map() -> dict:
     }
 
 
+# Providers that can return word-synced lyrics at all. Kugou only
+# ever returns line-level LRC, so once every provider left to try is
+# line-only the hunt for word sync is over.
+WORD_CAPABLE = {"betterlyrics", "unison", "amll", "qq", "netease", "lrclib"}
+
+
+def _split_punct(word: str) -> tuple[str, str, str]:
+    """(leading punctuation, core, trailing punctuation) of a word.
+
+    `*` counts as part of the core, not punctuation — it is the
+    censor marker, and the match below needs to see it.
+    """
+    start = 0
+    while start < len(word) and not word[start].isalnum() and word[start] != "*":
+        start += 1
+    end = len(word)
+    while end > start and not word[end - 1].isalnum() and word[end - 1] != "*":
+        end -= 1
+    return word[:start], word[start:end], word[end:]
+
+
+def _censored_word_match(censored: str, donor: str) -> bool:
+    """True when `donor` is the uncensored form of asterisked `censored`.
+
+    Same length, and every non-`*` character matches at the same
+    position (case-insensitive): `f**k` matches `fuck`, `Sh*t`
+    matches `shit`, `ni**a` matches `nigga` — but `f**k` does NOT
+    match `duck` (first letter differs). A token of only asterisks
+    can never be verified, so it never matches.
+    """
+    _, c_core, _ = _split_punct(censored)
+    _, d_core, _ = _split_punct(donor)
+    if "*" not in c_core or len(c_core) != len(d_core):
+        return False
+    if c_core.strip("*") == "":
+        return False
+    return all(c == "*" or c.lower() == d.lower()
+               for c, d in zip(c_core, d_core))
+
+
+def _donor_words(donor_line: LyricLine) -> list[str]:
+    """The donor line's words as plain strings — timed words when it
+    has them, otherwise the line text split on whitespace."""
+    if donor_line.words:
+        return [w.text for w in donor_line.words]
+    return donor_line.text.split()
+
+
+def _lines_compatible(censored: LyricLine, donor: LyricLine) -> bool:
+    """True when the donor line is provably the same line: same word
+    count, and every non-censored word in the censored line matches
+    the donor word at the same position. At least one such anchor
+    word is required — a line of only asterisked words cannot be
+    verified and never matches."""
+    c_words = ([w.text for w in censored.words] if censored.words
+               else censored.text.split())
+    d_words = _donor_words(donor)
+    if len(c_words) != len(d_words) or not c_words:
+        return False
+    anchors = 0
+    for c, d in zip(c_words, d_words):
+        if "*" in c:
+            continue
+        if _split_punct(c)[1].lower() != _split_punct(d)[1].lower():
+            return False
+        anchors += 1
+    return anchors >= 1
+
+
+def decensor_result(result: LyricsResult,
+                    donors: list[LyricsResult]) -> LyricsResult | None:
+    """Return a copy of `result` with asterisked words replaced from
+    an uncensored donor copy of the same track — or None when nothing
+    could be fixed.
+
+    The first uncensored donor with synced lines wins (a different
+    provider than the result itself — the same source would carry the
+    same asterisks). For each censored line, the nearest donor line
+    in time (within 1.0 s) that is provably the same line lends its
+    words; a word is substituted only when it matches the asterisked
+    token letter-for-letter around the asterisks. Timings ALWAYS stay
+    the censored result's own — only word text changes, and a fixed
+    word's syllable parts collapse to the whole word (the split is
+    lost, the word itself is correct). The copy is flagged
+    `decensored` with `decensored_from` naming the donor provider;
+    `raw_text` keeps the original censored file for the debug view.
+    """
+    if not result.is_censored or not result.has_synced:
+        return None
+    donor = None
+    for cand in donors:
+        if cand is result or cand.source == result.source:
+            continue
+        if cand.is_censored or not cand.has_synced:
+            continue
+        donor = cand
+        break
+    if donor is None:
+        return None
+    fixed_lines: list[LyricLine] = []
+    fixed_any = False
+    for line in result.synced_lines:
+        best = None
+        best_dt = 1.0
+        for dline in donor.synced_lines:
+            dt = abs(dline.time - line.time)
+            if dt <= best_dt and _lines_compatible(line, dline):
+                best = dline
+                best_dt = dt
+        if best is None:
+            fixed_lines.append(line)
+            continue
+        d_words = _donor_words(best)
+        c_words = ([w.text for w in line.words] if line.words
+                   else line.text.split())
+        new_text = line.text
+        new_words: list[LyricWord] = []
+        for idx, c in enumerate(c_words):
+            d = d_words[idx]
+            if "*" in c and _censored_word_match(c, d):
+                lead, _core, trail = _split_punct(c)
+                _d_lead, d_core, _d_trail = _split_punct(d)
+                fixed = lead + d_core + trail
+                if fixed != c:
+                    new_text = new_text.replace(c, fixed, 1)
+                    fixed_any = True
+            else:
+                fixed = c
+            if line.words:
+                w = line.words[idx]
+                parts = ([LyricWord(w.time, w.end, fixed)]
+                         if w.parts else [])
+                new_words.append(LyricWord(w.time, w.end, fixed,
+                                           w.is_background, parts=parts))
+        fixed_lines.append(LyricLine(line.time, new_text, words=new_words))
+    if not fixed_any:
+        return None
+    from dataclasses import replace as _replace
+    return _replace(result, synced_lines=fixed_lines, decensored=True,
+                    decensored_from=donor.source)
+
+
+def _maybe_decensor(result, artist, track, album, duration, order, enabled,
+                    decensor: bool):
+    """De-censor a winning auto-fetch result from the other providers'
+    copies of the same track, when enabled and when it is censored.
+    The donor pool comes from `search_all_candidates` (cached after
+    the first fetch, so repeat plays are local reads). Returns the
+    original result unchanged when there is nothing to fix."""
+    if not decensor or result is None or not result.is_censored:
+        return result
+    try:
+        donors = search_all_candidates(artist, track, album, duration,
+                                       order=order, enabled=enabled)
+    except Exception:
+        return result
+    fixed = decensor_result(result, donors)
+    return fixed if fixed is not None else result
+
+
 def fetch_lyrics(
     artist: str,
     track: str,
@@ -1145,19 +1315,27 @@ def fetch_lyrics(
     word_only: bool = False,
     use_cache: bool = True,
     cache_dir: Path | None = None,
+    decensor: bool = True,
 ) -> LyricsResult | None:
     """First matching lyrics, trying providers in `order`.
 
-    Defaults to the registry order (word-sync sources first, line-only
-    last). Disabled providers are skipped. With `word_only`, a
-    line-only result is skipped and the chain continues — the caller
-    gets word-synced lyrics or None, never a line-only fallback. A
-    provider returning None just falls through to the next; the track
-    never fails for one provider.
+    Defaults to the registry order. Disabled providers are skipped.
+    Word/syllable sync is preferred over provider order: the first
+    result WITH word sync wins, even when an earlier provider already
+    returned line-only lyrics (e.g. Unison's line-only LRC must not
+    beat AMLL's word-synced TTML, and NetEase's line fallback must
+    not beat LRCLIB's word-tagged record). Only when no provider has
+    word sync does the first line-synced (or plain) result win.
+    With `word_only`, a line-only result is skipped and the chain
+    continues — the caller gets word-synced lyrics or None, never a
+    line-only fallback. A provider returning None just falls through
+    to the next; the track never fails for one.
     """
     order, enabled = normalise_provider_prefs(order, enabled)
     fetchers = _fetcher_map()
-    for key in order:
+    first_synced = None
+    first_any = None
+    for i, key in enumerate(order):
         if not enabled.get(key, True):
             continue
         fn = fetchers[key]
@@ -1170,9 +1348,29 @@ def fetch_lyrics(
             continue
         if word_only and not result.has_word_sync:
             continue
-        if result.has_synced or result.plain_lyrics or result.instrumental:
-            return result
-    return None
+        if not (result.has_synced or result.plain_lyrics or result.instrumental):
+            continue
+        if result.has_word_sync:
+            return _maybe_decensor(result, artist, track, album, duration,
+                                   order, enabled, decensor)
+        if first_synced is None and result.has_synced:
+            first_synced = result
+        if first_any is None:
+            first_any = result
+        # Keep looking while a later provider could still return
+        # something better: word sync when we only have line sync
+        # (or plain), anything synced when we only have plain.
+        remaining = [k for k in order[i + 1:] if enabled.get(k, True)]
+        if not remaining:
+            break
+        if first_synced is not None and not any(
+                k in WORD_CAPABLE for k in remaining):
+            break
+    winner = first_synced if first_synced is not None else first_any
+    if winner is None:
+        return None
+    return _maybe_decensor(winner, artist, track, album, duration,
+                           order, enabled, decensor)
 
 
 def search_all_candidates(

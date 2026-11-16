@@ -25,6 +25,7 @@ from lyrics import (  # noqa: E402
     _REQUEST_LOG,
     cache_lrclib_record,
     clear_track_cache,
+    decensor_result,
     fetch_amll,
     fetch_betterlyrics,
     fetch_kugou,
@@ -493,9 +494,17 @@ def test_fetch_lyrics_order_enabled_word_only():
         _lyrics_module.fetch_kugou = lambda *a, **k: _res("kugou", word=False)
         # Default order: Better Lyrics wins.
         assert fetch_lyrics("Coldplay", "Yellow").source == "betterlyrics"
-        # Custom order: LRCLIB first wins.
+        # Word-first beats provider order: LRCLIB is first in the
+        # order but line-only, Better Lyrics is word-synced — the
+        # word result wins even though it comes later.
+        assert fetch_lyrics("Coldplay", "Yellow",
+                            order=["lrclib", "betterlyrics"]).source == "betterlyrics"
+        # Among word-synced results, order still decides: LRCLIB word
+        # first wins over Better Lyrics word.
+        _lyrics_module.fetch_lrclib = lambda *a, **k: _res("lrclib", word=True)
         assert fetch_lyrics("Coldplay", "Yellow",
                             order=["lrclib", "betterlyrics"]).source == "lrclib"
+        _lyrics_module.fetch_lrclib = lambda *a, **k: _res("lrclib", word=False)
         # Disabled provider is skipped entirely.
         assert fetch_lyrics("Coldplay", "Yellow",
                             enabled={"betterlyrics": False}).source == "unison"
@@ -550,6 +559,164 @@ def test_search_all_candidates_word_only_and_order():
         for name, fn in orig.items():
             setattr(_lyrics_module, name, fn)
     print("  search_all_candidates order/word_only: OK")
+
+
+def test_fetch_lyrics_word_first():
+    """Word/syllable sync beats provider order: a later word result
+    wins over an earlier line-only one; among word results the order
+    decides; with no word sync anywhere the first line result wins;
+    a plain-only result loses to a later synced one."""
+    def _res(source, word, synced=True):
+        line = LyricLine(5.0, "Look at the stars",
+                         words=[LyricWord(5.0, 6.0, "Look")] if word else [])
+        return LyricsResult(artist="Coldplay", track="Yellow", album="Parachutes",
+                            duration=269.0, synced_lines=[line] if synced else [],
+                            plain_lyrics="" if synced else "plain words",
+                            source=source)
+
+    names = ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_lrclib", "fetch_kugou")
+    orig = {name: getattr(_lyrics_module, name) for name in names}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: None
+        _lyrics_module.fetch_unison = lambda *a, **k: _res("unison", word=False)
+        _lyrics_module.fetch_amll = lambda *a, **k: _res("amll", word=True)
+        _lyrics_module.fetch_qq = lambda *a, **k: None
+        _lyrics_module.fetch_netease = lambda *a, **k: None
+        _lyrics_module.fetch_lrclib = lambda *a, **k: None
+        _lyrics_module.fetch_kugou = lambda *a, **k: None
+        # Unison line-only first, AMLL word second: the word wins.
+        assert fetch_lyrics("Coldplay", "Yellow").source == "amll"
+        # No word sync anywhere: first line result in order wins.
+        _lyrics_module.fetch_amll = lambda *a, **k: None
+        assert fetch_lyrics("Coldplay", "Yellow").source == "unison"
+        # Plain-only loses to a later synced result.
+        _lyrics_module.fetch_unison = lambda *a, **k: _res("unison", word=False, synced=False)
+        _lyrics_module.fetch_lrclib = lambda *a, **k: _res("lrclib", word=False)
+        assert fetch_lyrics("Coldplay", "Yellow").source == "lrclib"
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    print("  fetch_lyrics word-first: OK")
+
+
+def test_censored_word_match():
+    from lyrics import _censored_word_match
+    assert _censored_word_match("f**k", "fuck")
+    assert _censored_word_match("Sh*t", "shit")
+    assert _censored_word_match("ni**a", "nigga")
+    assert _censored_word_match("B**ch,", "Bitch,")
+    assert not _censored_word_match("f**k", "duck")  # first letter differs
+    assert not _censored_word_match("****", "fuck")  # all asterisks: unverifiable
+    assert not _censored_word_match("fuck", "fuck")  # not censored at all
+    assert not _censored_word_match("f**k", "fucking")  # length differs
+    print("  censored word match: OK")
+
+
+def test_decensor_result():
+    """De-censoring swaps asterisked words from an uncensored donor
+    copy of the same track, keeps the original timings, and refuses
+    anything it cannot verify."""
+    def _line(time, text, words=None):
+        return LyricLine(time, text, words=words or [])
+    def _word(time, end, text):
+        return LyricWord(time, end, text)
+
+    censored = LyricsResult(
+        artist="Kendrick Lamar", track="HUMBLE.", album="DAMN.", duration=177.0,
+        synced_lines=[
+            _line(10.0, "My left stroke just went viral",
+                  [_word(10.0, 10.4, "My"), _word(10.4, 10.8, "left"),
+                   _word(10.8, 11.2, "stroke"), _word(11.2, 11.6, "just"),
+                   _word(11.6, 12.0, "went"), _word(12.0, 12.4, "viral")]),
+            _line(20.0, "B**ch, sit down",
+                  [_word(20.0, 20.5, "B**ch,"), _word(20.5, 21.0, "sit"),
+                   _word(21.0, 21.5, "down")]),
+        ],
+        source="qq", raw_text="My left stroke just went viral\nB**ch, sit down")
+    donor = LyricsResult(
+        artist="Kendrick Lamar", track="HUMBLE.", album="DAMN.", duration=177.0,
+        synced_lines=[
+            _line(10.1, "My left stroke just went viral"),
+            _line(20.2, "Bitch, sit down"),
+        ],
+        source="search", raw_text="Bitch, sit down")
+    fixed = decensor_result(censored, [donor])
+    assert fixed is not None
+    assert fixed.synced_lines[1].text == "Bitch, sit down"
+    assert fixed.synced_lines[1].words[0].text == "Bitch,"
+    assert fixed.synced_lines[1].words[0].time == 20.0  # timing kept
+    assert fixed.decensored is True and fixed.decensored_from == "search"
+    assert fixed.is_censored is False
+    assert fixed.synced_lines[0].text == "My left stroke just went viral"
+    # The original is untouched.
+    assert censored.synced_lines[1].text == "B**ch, sit down"
+    # Wrong donor (different words on the line) fixes nothing.
+    wrong = LyricsResult(artist="Kendrick Lamar", track="HUMBLE.", duration=177.0,
+                         synced_lines=[_line(20.2, "Please, sit down")],
+                         source="search", raw_text="Please, sit down")
+    assert decensor_result(censored, [wrong]) is None
+    # Same-source donor carries the same asterisks: no fix.
+    same = LyricsResult(artist="Kendrick Lamar", track="HUMBLE.", duration=177.0,
+                        synced_lines=[_line(20.2, "B**ch, sit down")],
+                        source="qq", raw_text="B**ch, sit down")
+    assert decensor_result(censored, [same]) is None
+    # No donor at all.
+    assert decensor_result(censored, []) is None
+    # A line of only asterisked words cannot be verified: left alone.
+    all_cens = LyricsResult(artist="X", track="Y", duration=60.0,
+                            synced_lines=[_line(5.0, "**** ****",
+                                               [_word(5.0, 5.5, "****"),
+                                                _word(5.5, 6.0, "****")])],
+                            source="qq", raw_text="**** ****")
+    all_donor = LyricsResult(artist="X", track="Y", duration=60.0,
+                             synced_lines=[_line(5.1, "fuck shit")],
+                             source="search", raw_text="fuck shit")
+    assert decensor_result(all_cens, [all_donor]) is None
+    print("  decensor_result: OK")
+
+
+def test_fetch_lyrics_decensors_from_other_sources():
+    """Auto-fetch de-censors a censored winner from an uncensored
+    donor copy (and does not when the preference is off)."""
+    def _res(source, word, raw):
+        line = LyricLine(20.0, "B**ch, sit down",
+                         words=[LyricWord(20.0, 20.5, "B**ch,"),
+                                LyricWord(20.5, 21.0, "sit"),
+                                LyricWord(21.0, 21.5, "down")])
+        return LyricsResult(artist="Kendrick Lamar", track="HUMBLE.",
+                            album="DAMN.", duration=177.0,
+                            synced_lines=[line] if word else [],
+                            plain_lyrics="", source=source, raw_text=raw)
+
+    names = ("fetch_betterlyrics", "fetch_unison", "fetch_amll", "fetch_qq",
+             "fetch_netease", "fetch_kugou", "search_lrclib")
+    orig = {name: getattr(_lyrics_module, name) for name in names}
+    try:
+        _lyrics_module.fetch_betterlyrics = lambda *a, **k: None
+        _lyrics_module.fetch_unison = lambda *a, **k: None
+        _lyrics_module.fetch_amll = lambda *a, **k: None
+        _lyrics_module.fetch_qq = lambda *a, **k: _res("qq", True, "B**ch, sit down")
+        _lyrics_module.fetch_netease = lambda *a, **k: None
+        _lyrics_module.fetch_kugou = lambda *a, **k: None
+        _lyrics_module.search_lrclib = lambda *a, **k: [
+            LyricsResult(artist="Kendrick Lamar", track="HUMBLE.", album="DAMN.",
+                         duration=177.0,
+                         synced_lines=[LyricLine(20.2, "Bitch, sit down")],
+                         source="search", raw_text="Bitch, sit down")]
+        fixed = fetch_lyrics("Kendrick Lamar", "HUMBLE.", "DAMN.", 177.0)
+        assert fixed is not None and fixed.decensored is True
+        assert fixed.synced_lines[0].text == "Bitch, sit down"
+        assert fixed.decensored_from == "search"
+        # Preference off: the censored original comes back untouched.
+        raw = fetch_lyrics("Kendrick Lamar", "HUMBLE.", "DAMN.", 177.0,
+                           decensor=False)
+        assert raw is not None and raw.decensored is False
+        assert raw.synced_lines[0].text == "B**ch, sit down"
+    finally:
+        for name, fn in orig.items():
+            setattr(_lyrics_module, name, fn)
+    print("  fetch_lyrics de-censor: OK")
 
 
 def test_parse_ttml_amll_namespace():
@@ -801,6 +968,10 @@ TESTS = [
     test_parse_ttml_amll_namespace,
     test_normalise_provider_prefs,
     test_fetch_lyrics_order_enabled_word_only,
+    test_fetch_lyrics_word_first,
+    test_censored_word_match,
+    test_decensor_result,
+    test_fetch_lyrics_decensors_from_other_sources,
     test_search_all_candidates_word_only_and_order,
     test_elrc_word_parts,
     test_request_log,

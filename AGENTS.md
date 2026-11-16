@@ -370,7 +370,7 @@ no login, no API keys.
 - Config: `~/.config/synced-lyrics-linux/config.json`
   (offset, font_size, display, minimise_to_tray, overlay_opacity,
   overlay_click_through, line_animations, last_player,
-  provider_order, provider_enabled, word_only, start_mode).
+  provider_order, provider_enabled, word_only, decensor, start_mode).
 - Lyrics cache: `~/.cache/synced-lyrics-linux/*.json` — LRCLIB records
   as `<sha256>.json`, Better Lyrics TTML as `bl-<sha256>.json`,
   Unison as `un-<sha256>.json`, AMLL as `am-<sha256>.json`, QQ QRC as

@@ -74,6 +74,24 @@ class MonotonicPosition:
         self.anchor_time = now
 
 
+def _provider_name(source: str) -> str:
+    """Display name for a LyricsResult source (also for a decensor
+    donor: "search"/"cache" are LRCLIB records)."""
+    if source.startswith("betterlyrics"):
+        return "Better Lyrics"
+    if source.startswith("unison"):
+        return "Unison"
+    if source.startswith("amll"):
+        return "AMLL"
+    if source.startswith("qq"):
+        return "QQ Music"
+    if source.startswith("netease"):
+        return "NetEase"
+    if source.startswith("kugou"):
+        return "Kugou"
+    return "LRCLIB"
+
+
 class _LyricsWorker(QObject):
     result_ready = Signal(object)  # (key, LyricsResult | None | ("error", str))
     search_ready = Signal(object)  # (key, [LyricsResult] | ("error", str))
@@ -86,9 +104,10 @@ class _LyricsWorker(QObject):
         # the app config / Preferences dialog). The worker reads them
         # when a queued fetch/search slot runs, so a prefs change
         # applies to the next lookup without restarting anything.
-        # (order, enabled dict, word_only) — defaults: registry
-        # order, everything on, word sync preferred but not required.
-        self.lyrics_prefs = (list(DEFAULT_PROVIDER_ORDER), {}, False)
+        # (order, enabled dict, word_only, decensor) — defaults:
+        # registry order, everything on, word sync preferred but not
+        # required, de-censoring on.
+        self.lyrics_prefs = (list(DEFAULT_PROVIDER_ORDER), {}, False, True)
         self.fetch_requested.connect(self.fetch)
         self.search_requested.connect(self.search)
 
@@ -98,10 +117,11 @@ class _LyricsWorker(QObject):
                 # The cached lyrics were wrong: drop them first so a
                 # failed re-pull can't leave the wrong ones in place.
                 clear_track_cache(artist, track, album, duration)
-            order, enabled, word_only = self.lyrics_prefs
+            order, enabled, word_only, decensor = self.lyrics_prefs
             result = fetch_lyrics(artist, track, album, duration,
                                   order=order, enabled=enabled,
-                                  word_only=word_only, use_cache=not force)
+                                  word_only=word_only, use_cache=not force,
+                                  decensor=decensor)
             self.result_ready.emit((key, result))
         except LRCLIBRateLimited as e:
             self.result_ready.emit((key, ("error", f"LRCLIB rate limited — retry in {e.retry_after:.0f}s")))
@@ -111,7 +131,7 @@ class _LyricsWorker(QObject):
     def search(self, artist, track, album, duration, key):
         """All lyric candidates for the picker (all providers)."""
         try:
-            order, enabled, word_only = self.lyrics_prefs
+            order, enabled, word_only, _decensor = self.lyrics_prefs
             results = search_all_candidates(artist, track, album, duration,
                                             order=order, enabled=enabled,
                                             word_only=word_only)
@@ -154,6 +174,7 @@ class PlaybackEngine(QObject):
         self.provider_order = list(DEFAULT_PROVIDER_ORDER)
         self.provider_enabled = {k: True for k in DEFAULT_PROVIDER_ORDER}
         self.word_only = False
+        self.decensor = True
 
         self._worker_thread = QThread(self)
         self._worker = _LyricsWorker()
@@ -199,7 +220,8 @@ class PlaybackEngine(QObject):
         self.offset = seconds
         self._emit_position()
 
-    def set_lyrics_prefs(self, order, enabled, word_only: bool):
+    def set_lyrics_prefs(self, order, enabled, word_only: bool,
+                         decensor: bool = True):
         """Apply the lyrics preferences (from the Preferences dialog).
 
         Normalised here so a stale config can never leave a provider
@@ -211,7 +233,9 @@ class PlaybackEngine(QObject):
         self.provider_order = order
         self.provider_enabled = enabled
         self.word_only = bool(word_only)
-        self._worker.lyrics_prefs = (order, enabled, bool(word_only))
+        self.decensor = bool(decensor)
+        self._worker.lyrics_prefs = (order, enabled, bool(word_only),
+                                     bool(decensor))
         if self.track.title and self.track.artist and not self.demo:
             self._fetch_lyrics(self.track)
 
@@ -351,8 +375,12 @@ class PlaybackEngine(QObject):
                 provider = "LRCLIB"
             sync = "Word-synced" if result.has_word_sync else "Synced"
             cached = " [cached]" if "cache" in result.source else ""
+            dec = ""
+            if result.decensored:
+                dec = (f" (de-censored from "
+                       f"{_provider_name(result.decensored_from)})")
             self.status_changed.emit(
-                f"{sync} lyrics from {provider} ({len(result.synced_lines)} lines){cached}")
+                f"{sync} lyrics from {provider} ({len(result.synced_lines)} lines){cached}{dec}")
         elif result.plain_lyrics:
             self.status_changed.emit("Plain lyrics only — no sync data")
         else:

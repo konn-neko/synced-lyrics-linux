@@ -91,12 +91,20 @@ over a desktop. See [CONTRIBUTING.md](CONTRIBUTING.md)._
 - **Preferences** — `File > Preferences…` (Ctrl+,), also in the Overlay
   and tray menus. Lyrics sources: enable/disable each of the seven
   providers and drag them into your preferred order (tried top first).
-  Sync: "Only use word-synced lyrics" skips line-only results entirely,
+  **Word-synced lyrics are always preferred**: the auto-fetch returns
+  the first word/syllable-synced result it finds, even when an earlier
+  provider already returned line-only lyrics — only when no provider
+  has word sync does the first line-synced result win. Sync: "Only use
+  word-synced lyrics" skips line-only results entirely, "De-censor
+  lyrics using other sources" swaps asterisked words (`f**k`, `b**ch`)
+  from an uncensored copy of the same song when another provider has
+  one — same lines, same timings, only verified words are swapped —
   and the sync offset is a spinbox here too. Appearance: font size,
   smooth line animations, which window opens at launch. Overlay:
   opacity and click-through. Behaviour: minimise to tray, display.
   Plus a lyrics-cache size readout and a Clear cache button. Changing
-  the sources re-fetches the current track immediately.
+  the sources re-fetches the current track immediately. The dialog
+  scrolls on small screens instead of squashing its content.
 - **Any MPRIS player** — Spotify desktop, YouTube Music in Firefox /
   Chromium, VLC, Elisa… discovered automatically, no player names
   hardcoded. Player selector dropdown when several are playing.
@@ -320,8 +328,23 @@ display choice, minimise-to-tray, overlay opacity / click-through,
 `true`; set `false` for the instant old-style swap), last player,
 `provider_order` / `provider_enabled` (which lyrics sources to try,
 in which order), `word_only` (only word-synced lyrics, skip line-only
-results), `start_mode` (`full` or `overlay` — which window opens at
-launch). Edit it while the app is closed, or use File > Preferences…
+results), `decensor` (swap asterisked words from an uncensored copy
+of the same track, default `true`), `start_mode` (`full` or `overlay`
+— which window opens at launch). Edit it while the app is closed, or
+use File > Preferences…
+
+Word sync is always preferred over provider order: the auto-fetch
+keeps looking past a line-only result while a later provider could
+still return word sync, and only falls back to the first line-synced
+result when none does. When the winning lyrics are censored and
+another provider has an uncensored copy of the same song, the
+asterisked words are swapped in from that copy — the lines and their
+timings stay the winner's own, and only words the app can verify
+letter-for-letter around the asterisks are swapped (a word of bare
+`****` is never guessed). The status bar says who the clean words
+came from, e.g. `Word-synced lyrics from QQ Music (de-censored from
+LRCLIB)`, and the raw file in Help > Lyrics debug still shows the
+original censored text exactly as received.
 
 When a new song is detected, the displayed lyrics are cleared at once
 — the previous track's lines never linger while the new lookup runs.
