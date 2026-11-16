@@ -7,14 +7,19 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the apt package names below were validated
+    # against 24.04 (noble), and ubuntu-latest moves to Ubuntu 26 from
+    # 2026-10-19. Bump this deliberately with the package list.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v4
+      # checkout/setup-python majors that run on Node 24; the older node20
+      # releases are deprecated and produce a warning annotation.
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
