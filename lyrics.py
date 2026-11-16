@@ -1168,30 +1168,26 @@ def _split_punct(word: str) -> tuple[str, str, str]:
     return word[:start], word[start:end], word[end:]
 
 
-def _censored_word_match(censored: str, donor: str) -> bool:
-    """True when `donor` is the uncensored form of asterisked `censored`.
+def _uncensored_word(censored: str, donor: str) -> str | None:
+    """Return a verified replacement with the winner's punctuation, or None.
 
-    Same length, and every non-`*` character matches at the same
-    position (case-insensitive): `f**k` matches `fuck`, `Sh*t`
-    matches `shit`, `ni**a` matches `nigga` — but `f**k` does NOT
-    match `duck` (first letter differs). A fully-asterisked word
-    (`****`) has no letters to verify against, so it matches any
-    uncensored donor word — the line-level match (same word count,
-    every other word identical, timestamp within 1.0 s) is the proof
-    there, and the caller only calls this for a donor line already
-    proven to be the same line. A donor word that is itself
-    asterisked never matches.
+    Visible characters must match case-insensitively. A donor's final
+    in-apostrophe can stand for ing only if the winner shows the g.
+    Fully asterisked words rely on the caller's line-level alignment.
     """
-    _, c_core, _ = _split_punct(censored)
-    _, d_core, _ = _split_punct(donor)
-    if "*" not in c_core or "*" in d_core:
-        return False
-    if c_core.strip("*") == "":
-        return True  # fully asterisked: line match is the proof
-    if len(c_core) != len(d_core):
-        return False
-    return all(c == "*" or c.lower() == d.lower()
-               for c, d in zip(c_core, d_core))
+    lead, c_core, trail = _split_punct(censored)
+    _, d_core, d_trail = _split_punct(donor)
+    if "*" not in c_core or not d_core or "*" in d_core:
+        return None
+    if (c_core.lower().endswith("ing") and d_core.lower().endswith("in")
+            and d_trail.startswith(("'", "’"))
+            and len(c_core) == len(d_core) + 1):
+        d_core += c_core[-1]
+    if c_core.strip("*") and (len(c_core) != len(d_core) or not all(
+            c == "*" or c.lower() == d.lower()
+            for c, d in zip(c_core, d_core))):
+        return None
+    return lead + d_core + trail
 
 
 def _donor_words(donor_line: LyricLine) -> list[str]:
@@ -1228,7 +1224,7 @@ def _align_lines(censored: LyricLine, donor: LyricLine) -> dict[int, int] | None
     - `delete` / `insert` blocks of uncensored words are tolerated:
       they are transcription variants, and the caller never
       substitutes them — only asterisked words are ever replaced,
-      and each one still has to pass `_censored_word_match`
+      and each one still has to pass `_uncensored_word`
       letter-for-letter around the asterisks.
     """
     c_words = ([w.text for w in censored.words] if censored.words
@@ -1406,13 +1402,10 @@ def decensor_result(result: LyricsResult,
         new_words: list[LyricWord] = []
         for idx, c in enumerate(c_words):
             d = d_words[mapping[idx]] if idx in mapping else None
-            if d is not None and "*" in c and _censored_word_match(c, d):
-                lead, _core, trail = _split_punct(c)
-                _d_lead, d_core, _d_trail = _split_punct(d)
-                fixed = lead + d_core + trail
-                if fixed != c:
-                    new_text = new_text.replace(c, fixed, 1)
-                    fixed_any = True
+            fixed = _uncensored_word(c, d) if d is not None else None
+            if fixed is not None and fixed != c:
+                new_text = new_text.replace(c, fixed, 1)
+                fixed_any = True
             else:
                 fixed = c
             if line.words:

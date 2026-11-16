@@ -601,21 +601,27 @@ def test_fetch_lyrics_word_first():
 
 
 def test_censored_word_match():
-    from lyrics import _censored_word_match
-    assert _censored_word_match("f**k", "fuck")
-    assert _censored_word_match("Sh*t", "shit")
-    assert _censored_word_match("ni**a", "nigga")
-    assert _censored_word_match("B**ch,", "Bitch,")
-    assert not _censored_word_match("f**k", "duck")  # first letter differs
-    # A fully-asterisked word takes the donor word — the line-level
-    # match is the proof there, since there are no letters to check.
-    assert _censored_word_match("****", "fuck")
-    assert _censored_word_match("****,", "Bitch,")
-    # But a donor word that is itself asterisked never matches.
-    assert not _censored_word_match("****", "f**k")
-    assert not _censored_word_match("f**k", "f**k")
-    assert not _censored_word_match("fuck", "fuck")  # not censored at all
-    assert not _censored_word_match("f**k", "fucking")  # length differs
+    from lyrics import _uncensored_word
+    assert _uncensored_word("f**k", "fuck") == "fuck"
+    assert _uncensored_word("Sh*t", "shit") == "shit"
+    assert _uncensored_word("ni**a", "nigga") == "nigga"
+    assert _uncensored_word("B**ch,", "Bitch,") == "Bitch,"
+    assert _uncensored_word("f**k", "duck") is None  # first letter differs
+    # Fully asterisked words rely on line alignment; empty donors cannot fill them.
+    assert _uncensored_word("****", "fuck") == "fuck"
+    assert _uncensored_word("****,", "Bitch,") == "Bitch,"
+    assert _uncensored_word("****", "!!!") is None
+    assert _uncensored_word("****", "f**k") is None
+    assert _uncensored_word("f**k", "f**k") is None
+    assert _uncensored_word("fuck", "fuck") is None  # not censored
+    assert _uncensored_word("f**k", "fucking") is None  # length differs
+    assert _uncensored_word("f**king", "fuckin'") == "fucking"
+    assert _uncensored_word("(F**KING),", "FUCKIN’!") == "(FUCKING),"
+    assert _uncensored_word("f**king", "duckin'") is None  # visible letter differs
+    assert _uncensored_word("f**king", "fuckin") is None  # no contraction marker
+    assert _uncensored_word("f**kin*", "fuckin'") is None  # g is not visible
+    assert _uncensored_word("f**king", "fuckin'ish") is None
+    assert _uncensored_word("f**king", "f**kin'") is None  # donor is censored
     print("  censored word match: OK")
 
 
@@ -699,6 +705,39 @@ def test_decensor_result():
     assert fixed_star.synced_lines[0].words[0].time == 30.0  # timing kept
     assert fixed_star.decensored is True
     print("  decensor_result: OK")
+
+
+def test_decensor_dropped_g():
+    """QQ's visible g survives an aligned LRCLIB in-apostrophe spelling."""
+    line = LyricLine(52.0, "So f**king, done", words=[
+        LyricWord(52.0, 52.2, "So"),
+        LyricWord(52.2, 53.0, "f**king,", parts=[
+            LyricWord(52.2, 52.6, "f**"), LyricWord(52.6, 53.0, "king,")]),
+        LyricWord(53.0, 53.4, "done"),
+    ])
+    censored = LyricsResult(artist="A", track="T", source="qq",
+                            synced_lines=[line], raw_text=line.text)
+    donor = LyricsResult(artist="A", track="T", source="search",
+                         synced_lines=[LyricLine(52.1, "So fuckin' done")],
+                         raw_text="So fuckin' done")
+    fixed = decensor_result(censored, [donor])
+    assert fixed is not None and fixed.synced_lines[0].text == "So fucking, done"
+    word = fixed.synced_lines[0].words[1]
+    assert (word.text, word.time, word.end) == ("fucking,", 52.2, 53.0)
+    assert len(word.parts) == 1 and word.parts[0].text == "fucking,"
+    assert not fixed.is_censored
+    assert censored.synced_lines[0].words[1].text == "f**king,"
+
+    # Matching a contraction still requires a line anchor and close timestamps.
+    unanchored = LyricsResult(artist="A", track="T", source="search",
+                              synced_lines=[LyricLine(52.1, "fuckin'")],
+                              raw_text="fuckin'")
+    distant = LyricsResult(artist="A", track="T", source="search",
+                           synced_lines=[LyricLine(53.1, "So fuckin' done")],
+                           raw_text="So fuckin' done")
+    assert decensor_result(censored, [unanchored]) is None
+    assert decensor_result(censored, [distant]) is None
+    print("  decensor dropped-g contraction: OK")
 
 
 def test_decensor_full_asterisk_line_neighbours():
@@ -1134,6 +1173,7 @@ TESTS = [
     test_fetch_lyrics_word_first,
     test_censored_word_match,
     test_decensor_result,
+    test_decensor_dropped_g,
     test_decensor_full_asterisk_line_neighbours,
     test_decensor_line_variants,
     test_fetch_lyrics_decensors_from_other_sources,
