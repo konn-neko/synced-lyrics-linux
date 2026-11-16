@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs: lets a maintainer start a run and cancel it on purpose, which
+  # is how the cancelled-run artifact behaviour gets checked.
+  workflow_dispatch:
 
 # A newer push to the same ref supersedes the older run instead of leaving two
 # full Qt runs racing; the cancelled one is visible in the run list.
@@ -64,8 +67,8 @@ jobs:
       # shown offscreen with no player, network or tray involved. Exit 0
       # alone is not enough, though: the MPRIS Seeked test prints SKIP
       # instead of OK when the session bus is unavailable, so a shrunken run
-      # would still look green. Assert the suite's own check count and that
-      # the MPRIS check actually ran.
+      # would still look green. Assert that nothing skipped, that the MPRIS
+      # check actually ran, and that the suite reached its final line.
       - name: UI smoke suite (offscreen)
         run: |
           set -o pipefail
@@ -88,11 +91,67 @@ jobs:
             exit 1
           fi
 
+      # A short summary on the run page itself, so a red run can be read
+      # without the artifact (or the authenticated logs API): counts per
+      # suite, each suite's final line, and every failure/skip line.
+      - name: Write run summary
+        if: always()
+        run: |
+          python - "$RUNNER_TEMP" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          tmp, out = Path(sys.argv[1]), Path(sys.argv[2])
+          rows, notes = [], []
+
+          lyrics = tmp / "lyrics.log"
+          if lyrics.exists():
+              text = lyrics.read_text(errors="replace")
+              found = re.findall(r"(\d+) passed, (\d+) skipped, (\d+) failed", text)
+              if found:
+                  passed, skipped, failed = found[-1]
+              else:
+                  passed = skipped = "?"
+                  failed = "1" if re.search(r"Traceback|^(FAIL|ERROR) ", text, re.M) else "0"
+              body = [ln for ln in text.splitlines() if ln.strip()]
+              rows.append(["lyrics", passed, skipped, failed, body[-1] if body else "(no output)"])
+              notes += [f"lyrics failure: `{ln}`" for ln in body if re.match(r"^(FAIL|ERROR) ", ln)][:10]
+              if skipped not in ("0", "?"):
+                  notes.append(f"lyrics skipped {skipped} (the test_live_* network checks are off in CI)")
+
+          smoke = tmp / "smoke.log"
+          if smoke.exists():
+              body = [ln for ln in smoke.read_text(errors="replace").splitlines() if ln.strip()]
+              ran = sum(1 for ln in body if ": OK" in ln)
+              skipped = sum(1 for ln in body if re.search(r": SKIP|^SKIP ", ln))
+              done = "test_ui_smoke: OK — all checks passed" in body
+              rows.append(["ui smoke", str(ran), str(skipped), "0" if done else "1",
+                           "test_ui_smoke: OK — all checks passed" if done
+                           else "(suite did not finish)"])
+              if not done:
+                  notes.append("ui smoke stopped after %d checks; last lines: %s"
+                               % (ran, " / ".join(body[-3:])))
+              if skipped:
+                  notes.append("ui smoke skipped %d check(s)" % skipped)
+
+          lines = ["## Suites", "", "| suite | passed | skipped | failed | final line |",
+                   "|---|---|---|---|---|"]
+          if rows:
+              for row in rows:
+                  cells = [str(c).replace("|", "\\|") for c in row]
+                  lines.append("| " + " | ".join(cells) + " |")
+          else:
+              lines.append("| — | — | — | — | failed before any suite ran |")
+          lines += ["", "### Failures and skips", ""]
+          lines += [f"- {note}" for note in notes] or ["- none"]
+          with open(out, "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+
       # Both suites tee their output to $RUNNER_TEMP. Upload those files
-      # unconditionally: a red run can then be diagnosed from the artifact
-      # instead of the logs API (which needs authentication), and a run cut
-      # short by the concurrency group still leaves its partial logs behind.
-      # The cost is a couple of KB per green run, kept 7 days.
+      # unconditionally: a run cut short by the concurrency group still
+      # leaves its partial logs behind, for details the summary leaves out.
       - name: Upload suite logs
         if: always()
         uses: actions/upload-artifact@v6
