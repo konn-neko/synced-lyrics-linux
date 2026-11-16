@@ -56,7 +56,9 @@ jobs:
       - name: Lyrics parser suite (live network checks off)
         env:
           LYRICS_LIVE_TESTS: "0"
-        run: python test_lyrics.py
+        run: |
+          set -o pipefail
+          python test_lyrics.py 2>&1 | tee "$RUNNER_TEMP/lyrics.log"
 
       # The suite's exit code is the assertion: it must exit 0. The app is
       # shown offscreen with no player, network or tray involved. Exit 0
@@ -68,7 +70,7 @@ jobs:
         run: |
           set -o pipefail
           log="$RUNNER_TEMP/smoke.log"
-          dbus-run-session -- python test_ui_smoke.py | tee "$log"
+          dbus-run-session -- python test_ui_smoke.py 2>&1 | tee "$log"
           echo "checks passed: $(grep -c ': OK' "$log" || true)"
           # No fixed total: any skip fails the job, so adding a check later
           # needs no CI edit, while a quietly skipped one can never pass.
@@ -85,3 +87,17 @@ jobs:
             echo "::error::suite did not reach its final OK line"
             exit 1
           fi
+
+      # Both suites tee their output to $RUNNER_TEMP. Upload those files only
+      # when something failed, so a red run can be diagnosed from the
+      # artifact instead of the logs API, which needs authentication.
+      - name: Upload suite logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: suite-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/lyrics.log
+            ${{ runner.temp }}/smoke.log
+          if-no-files-found: warn
+          retention-days: 7

@@ -495,7 +495,10 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   CI edit, but a skipped one can never pass), requires the
   `MPRIS Seeked subscription: OK` line, and requires the suite's final
   `test_ui_smoke: OK` line, so a shrunken run fails the job. A
-  `concurrency` group cancels the run a newer push replaces.
+  `concurrency` group cancels the run a newer push replaces. Both suites tee
+  their output to `$RUNNER_TEMP`, and a failed run uploads `lyrics.log` and
+  `smoke.log` as the `suite-logs-*` artifact (7 days) so it can be diagnosed
+  without authenticated log access.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo
