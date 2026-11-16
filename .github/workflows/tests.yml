@@ -91,66 +91,55 @@ jobs:
             exit 1
           fi
 
-      # A short summary on the run page itself, so a red run can be read
-      # without the artifact (or the authenticated logs API): counts per
-      # suite, each suite's final line, and every failure/skip line.
+      # A short summary on the run page, plus ::notice:: annotations: the job
+      # summary panel does not render for signed-out viewers, while annotations
+      # are public, so the same facts reach both.
       - name: Write run summary
         if: always()
         run: |
-          summary="$GITHUB_STEP_SUMMARY"
+          lyr="$RUNNER_TEMP/lyrics.log"; smk="$RUNNER_TEMP/smoke.log"
+          row() { printf '| %s | %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4" "$5"; }
+          if [ -f "$lyr" ]; then
+            counts=$(grep -oE '[0-9]+ passed, [0-9]+ skipped, [0-9]+ failed' "$lyr" | tail -1)
+            set -- ${counts:-? passed, ? skipped, ? failed}
+            lrow=("lyrics" "$1" "$3" "$5" "$(tail -n1 "$lyr" | tr '|' '/')")
+          else
+            lrow=("lyrics" "—" "—" "—" "no output")
+          fi
+          if [ -f "$smk" ]; then
+            ok=$(grep -c ': OK' "$smk" || true); sk=$(grep -cE ': SKIP|^SKIP ' "$smk" || true)
+            if grep -qx 'test_ui_smoke: OK — all checks passed' "$smk"; then
+              srow=("ui smoke" "$ok" "$sk" 0 "test_ui_smoke: OK — all checks passed")
+            else
+              srow=("ui smoke" "$ok" "$sk" 1 "(did not finish)")
+            fi
+          else
+            srow=("ui smoke" "—" "—" "—" "no output")
+          fi
           {
-            echo "## Suites"
-            echo ""
+            echo "## Suites"; echo
             echo "| suite | passed | skipped | failed | final line |"
             echo "|---|---|---|---|---|"
-            if [ -f "$RUNNER_TEMP/lyrics.log" ]; then
-              counts=$(grep -oE '[0-9]+ passed, [0-9]+ skipped, [0-9]+ failed' "$RUNNER_TEMP/lyrics.log" | tail -1)
-              last=$(grep -v '^[[:space:]]*$' "$RUNNER_TEMP/lyrics.log" | tail -1 | tr '|' '/')
-              if [ -n "$counts" ]; then
-                echo "| lyrics | $(echo "$counts" | cut -d' ' -f1) | $(echo "$counts" | cut -d' ' -f3) | $(echo "$counts" | cut -d' ' -f5) | $last |"
-              else
-                echo "| lyrics | ? | ? | ? | $last |"
-              fi
+            row "${lrow[@]}"; row "${srow[@]}"; echo
+            echo "### Failures and skips"; echo
+            found=0
+            if [ -f "$lyr" ] && grep -qE '^(FAIL|ERROR) ' "$lyr"; then
+              grep -E '^(FAIL|ERROR) ' "$lyr" | head -5 | sed 's/^/- lyrics: /'; found=1
             fi
-            if [ -f "$RUNNER_TEMP/smoke.log" ]; then
-              ran=$(grep -c ': OK' "$RUNNER_TEMP/smoke.log" || true)
-              skipped=$(grep -cE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log" || true)
-              if grep -qx 'test_ui_smoke: OK — all checks passed' "$RUNNER_TEMP/smoke.log"; then
-                echo "| ui smoke | $ran | $skipped | 0 | test_ui_smoke: OK — all checks passed |"
-              else
-                echo "| ui smoke | $ran | $skipped | 1 | (suite did not finish) |"
-              fi
+            if [ -f "$lyr" ] && grep -q '^SKIP ' "$lyr"; then
+              echo "- lyrics skipped $(grep -c '^SKIP ' "$lyr") (the test_live_* network checks are off in CI)"; found=1
             fi
-            if [ ! -f "$RUNNER_TEMP/lyrics.log" ] && [ ! -f "$RUNNER_TEMP/smoke.log" ]; then
-              echo "| — | — | — | — | failed before any suite ran |"
+            if [ -f "$smk" ] && ! grep -qx 'test_ui_smoke: OK — all checks passed' "$smk"; then
+              echo "- ui smoke stopped early: $(tail -n1 "$smk")"; found=1
             fi
-            echo ""
-            echo "### Failures and skips"
-            echo ""
-            if [ -f "$RUNNER_TEMP/lyrics.log" ] && grep -qE '^(FAIL|ERROR) ' "$RUNNER_TEMP/lyrics.log"; then
-              grep -E '^(FAIL|ERROR) ' "$RUNNER_TEMP/lyrics.log" | head -10 | sed 's/^/- lyrics: /'
-            fi
-            if [ -f "$RUNNER_TEMP/lyrics.log" ] && grep -q '^SKIP ' "$RUNNER_TEMP/lyrics.log"; then
-              echo "- lyrics skipped $(grep -c '^SKIP ' "$RUNNER_TEMP/lyrics.log") (the test_live_* network checks are off in CI)"
-            fi
-            if [ -f "$RUNNER_TEMP/smoke.log" ] && ! grep -qx 'test_ui_smoke: OK — all checks passed' "$RUNNER_TEMP/smoke.log"; then
-              echo "- ui smoke stopped early; last lines:"
-              echo '  ```'
-              grep -v '^[[:space:]]*$' "$RUNNER_TEMP/smoke.log" | tail -3 | sed 's/^/  /'
-              echo '  ```'
-            fi
-            if [ -f "$RUNNER_TEMP/smoke.log" ] && grep -qE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log"; then
-              echo "- ui smoke skipped $(grep -cE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log") check(s)"
-            fi
-            if [ ! -f "$RUNNER_TEMP/lyrics.log" ] && [ ! -f "$RUNNER_TEMP/smoke.log" ]; then
-              echo "- none"
-            fi
-          } >> "$summary"
-          # Self-check: an empty summary would leave a red run unreadable, so say
-          # so on the run page (annotations are public) instead of failing silent.
-          if [ ! -s "$summary" ]; then
-            echo "::warning::CI summary file is empty; the run page has no suite table"
-          fi
+            [ "$found" = 0 ] && echo "- none"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Public copy: annotations render when signed out, the summary panel does not.
+          echo "::notice::suites — lyrics ${lrow[1]} passed / ${lrow[2]} skipped / ${lrow[3]} failed; ui smoke ${srow[1]} passed / ${srow[2]} skipped / ${srow[3]} failed"
+          [ -f "$lyr" ] && grep -hE '^(FAIL|ERROR) ' "$lyr" | head -3 | sed 's/^/::error::lyrics /'
+          [ -f "$smk" ] && ! grep -qx 'test_ui_smoke: OK — all checks passed' "$smk" && \
+            echo "::error::ui smoke stopped before the end: $(tail -n1 "$smk")"
+          [ -s "$GITHUB_STEP_SUMMARY" ] || echo "::warning::CI summary file is empty"
 
       # Both suites tee their output to $RUNNER_TEMP. Upload those files
       # unconditionally: a run cut short by the concurrency group still
