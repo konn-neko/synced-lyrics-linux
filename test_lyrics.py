@@ -839,6 +839,82 @@ def test_decensor_line_variants():
     print("  decensor line variants (Lalala): OK")
 
 
+def test_decensor_split_lines():
+    """Regression: Ashnikko — Toxic (2026-11-16). Two de-censor
+    gaps in one track. (1) Every donor splits the winner's line in
+    two — QQ has "Like Britney b***h I drop you just because I
+    can" on one line, Better Lyrics has "…like Britney, bitch" +
+    "I drop you just because I can" — so no single donor line
+    aligns; merged runs of consecutive donor lines must be tried.
+    (2) The first uncensored donor cannot fix every line — the
+    second line only matches a later donor — so each line takes its
+    best match across the whole pool, not just the first donor."""
+    def _line(time, text):
+        return LyricLine(time, text)
+    censored = LyricsResult(
+        artist="Ashnikko", track="Toxic", album="DEMIDEVIL",
+        duration=162.0,
+        synced_lines=[
+            _line(62.80, "Like Britney b***h I drop you just because I can"),
+            _line(66.55, "You think you're the man b***h please"),
+        ],
+        source="qq",
+        raw_text="Like Britney b***h I drop you just because I can\n"
+                 "You think you're the man b***h please")
+    split_donor = LyricsResult(
+        artist="Ashnikko", track="Toxic", album="DEMIDEVIL",
+        duration=162.0,
+        synced_lines=[
+            _line(60.55, "You're so toxic, like Britney, bitch"),
+            _line(63.81, "I drop you just because I can"),
+        ],
+        source="betterlyrics",
+        raw_text="You're so toxic, like Britney, bitch")
+    other_donor = LyricsResult(
+        artist="Ashnikko", track="Toxic", album="DEMIDEVIL",
+        duration=162.0,
+        synced_lines=[
+            _line(66.24, "You think you're the man (bitch, please)"),
+        ],
+        source="search",
+        raw_text="You think you're the man (bitch, please)")
+    fixed = decensor_result(censored, [split_donor, other_donor])
+    assert fixed is not None
+    assert fixed.synced_lines[0].text == \
+        "Like Britney bitch I drop you just because I can"
+    assert fixed.synced_lines[0].time == 62.80  # timing kept
+    assert fixed.synced_lines[1].text == \
+        "You think you're the man bitch please"
+    assert fixed.synced_lines[1].time == 66.55  # timing kept
+    assert fixed.decensored is True
+    # One word fixed from each donor: the tie names the first donor
+    # in pool order.
+    assert fixed.decensored_from == "betterlyrics"
+    assert fixed.is_censored is False
+    assert censored.synced_lines[0].text == \
+        "Like Britney b***h I drop you just because I can"
+    # The same split pair, but 30 s away in time, proves nothing.
+    far_donor = LyricsResult(
+        artist="Ashnikko", track="Toxic", album="DEMIDEVIL",
+        duration=162.0,
+        synced_lines=[
+            _line(30.55, "You're so toxic, like Britney, bitch"),
+            _line(33.81, "I drop you just because I can"),
+        ],
+        source="betterlyrics",
+        raw_text="You're so toxic, like Britney, bitch")
+    one_line = LyricsResult(
+        artist="Ashnikko", track="Toxic", album="DEMIDEVIL",
+        duration=162.0,
+        synced_lines=[
+            _line(62.80, "Like Britney b***h I drop you just because I can"),
+        ],
+        source="qq",
+        raw_text="Like Britney b***h I drop you just because I can")
+    assert decensor_result(one_line, [far_donor]) is None
+    print("  decensor split lines (Toxic): OK")
+
+
 def test_fetch_lyrics_decensors_from_other_sources():
     """Auto-fetch de-censors a censored winner from an uncensored
     donor copy (and does not when the preference is off)."""
@@ -1136,6 +1212,7 @@ TESTS = [
     test_decensor_result,
     test_decensor_full_asterisk_line_neighbours,
     test_decensor_line_variants,
+    test_decensor_split_lines,
     test_fetch_lyrics_decensors_from_other_sources,
     test_search_all_candidates_word_only_and_order,
     test_elrc_word_parts,
