@@ -499,7 +499,12 @@ QT_QPA_PLATFORM=offscreen ~/.local/lyrics-venv/bin/python test_ui_smoke.py   # a
   their output to `$RUNNER_TEMP`, and the job uploads `lyrics.log` and
   `smoke.log` as the `suite-logs-*` artifact on every run (`if: always()`, 7
   days): a failed or cancelled run keeps its partial logs, so it can be
-  diagnosed without authenticated log access.
+  diagnosed without authenticated log access. A `Write run summary` step
+  (`if: always()`) also puts a per-suite passed/skipped/failed table, each
+  suite's final line and every failing check into `$GITHUB_STEP_SUMMARY`, so a
+  red run is readable from the public run page alone. `workflow_dispatch` lets
+  a maintainer start (and cancel) a run without pushing a commit, which is how
+  the cancelled-run behaviour is tested.
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --demo
 QT_QPA_PLATFORM=offscreen timeout 8 python3 synced_lyrics.py --mode overlay --screen 1 --demo
