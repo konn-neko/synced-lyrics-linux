@@ -167,19 +167,20 @@ def is_censored_text(text: str) -> bool:
     Providers that censor explicit lyrics write them as `f**k`,
     `Sh*t`, `b**ch`, `ni**a` or a bare `****` — a token containing
     `*` next to letters, or a token of two or more asterisks. A lone
-    `*` (e.g. a multiplication sign) does not count. A track that
+    `*` (e.g. a multiplication sign) does not count. Punctuation
+    attached to the token (`****,`) does not hide it: the check runs
+    on the token's core, asterisks included. A track that
     legitimately uses `***` as a separator would false-positive;
     that is rare, and the only cost is a "censored" tag and a lower
     sort rank in the picker.
     """
     for token in re.split(r"\s+", text or ""):
-        if not token:
+        if not token or "*" not in token:
             continue
-        if "*" not in token:
-            continue
-        if len(token) >= 2 and token.strip("*") == "":
+        _lead, core, _trail = _split_punct(token)
+        if len(core) >= 2 and core.strip("*") == "":
             return True  # bare "****" standing in for a word
-        if any(c.isalnum() for c in token):
+        if any(c.isalnum() for c in core):
             return True  # "f**k", "Sh*t", "b**ch" ...
     return False
 
@@ -1172,14 +1173,21 @@ def _censored_word_match(censored: str, donor: str) -> bool:
     Same length, and every non-`*` character matches at the same
     position (case-insensitive): `f**k` matches `fuck`, `Sh*t`
     matches `shit`, `ni**a` matches `nigga` — but `f**k` does NOT
-    match `duck` (first letter differs). A token of only asterisks
-    can never be verified, so it never matches.
+    match `duck` (first letter differs). A fully-asterisked word
+    (`****`) has no letters to verify against, so it matches any
+    uncensored donor word — the line-level match (same word count,
+    every other word identical, timestamp within 1.0 s) is the proof
+    there, and the caller only calls this for a donor line already
+    proven to be the same line. A donor word that is itself
+    asterisked never matches.
     """
     _, c_core, _ = _split_punct(censored)
     _, d_core, _ = _split_punct(donor)
-    if "*" not in c_core or len(c_core) != len(d_core):
+    if "*" not in c_core or "*" in d_core:
         return False
     if c_core.strip("*") == "":
+        return True  # fully asterisked: line match is the proof
+    if len(c_core) != len(d_core):
         return False
     return all(c == "*" or c.lower() == d.lower()
                for c, d in zip(c_core, d_core))
@@ -1225,7 +1233,9 @@ def decensor_result(result: LyricsResult,
     same asterisks). For each censored line, the nearest donor line
     in time (within 1.0 s) that is provably the same line lends its
     words; a word is substituted only when it matches the asterisked
-    token letter-for-letter around the asterisks. Timings ALWAYS stay
+    token letter-for-letter around the asterisks — or, when the token
+    is fully asterisked (`****`), when the rest of the line anchors
+    it and the donor word is uncensored. Timings ALWAYS stay
     the censored result's own — only word text changes, and a fixed
     word's syllable parts collapse to the whole word (the split is
     lost, the word itself is correct). The copy is flagged

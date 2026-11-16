@@ -340,8 +340,10 @@ result when none does. When the winning lyrics are censored and
 another provider has an uncensored copy of the same song, the
 asterisked words are swapped in from that copy — the lines and their
 timings stay the winner's own, and only words the app can verify
-letter-for-letter around the asterisks are swapped (a word of bare
-`****` is never guessed). The status bar says who the clean words
+are swapped: letter-for-letter around the asterisks, or, for a
+fully-asterisked word (`****`), by the rest of the line anchoring
+it. (A line of only asterisks still can't be verified and is left
+alone.) The status bar says who the clean words
 came from, e.g. `Word-synced lyrics from QQ Music (de-censored from
 LRCLIB)`, and the raw file in Help > Lyrics debug still shows the
 original censored text exactly as received.

@@ -261,7 +261,8 @@ no login, no API keys.
   recordings have no lyrics at all, "暂无歌词") fifth; **LRCLIB**
   (line-level, some records Enhanced-LRC word tags) sixth; **Kugou**
   (`/kugou/getLyrics`, line-level LRC only) last. Auto-fetch tries
-  them in that order; the picker (`search_all_candidates`) merges
+  them in that order, but word sync beats order (see Word-first
+  below); the picker (`search_all_candidates`) merges
   all seven and sorts word-synced first, uncensored above censored
   at the same sync level, provider order within that. Caches:
   `bl-<key>.json` (TTML), `un-<key>.json` (Unison),
@@ -283,6 +284,48 @@ no login, no API keys.
   is the one to use. Musixmatch (needs an API key) and Apple Music
   (needs a developer token) are NOT viable under the no-keys rule,
   so they are not wired in.
+- Word-first auto-fetch (`fetch_lyrics` in lyrics.py): the chain
+  returns the first result WITH word sync even when an earlier
+  provider already returned line-only lyrics — Unison's line-only
+  LRC must not beat AMLL's word-synced TTML, and NetEase's line
+  fallback must not beat LRCLIB's word-tagged record. It keeps
+  looking past line-only (or plain-only) results while a later
+  provider could still return word sync (`WORD_CAPABLE` — every
+  provider except Kugou, which is line-only by nature); only when
+  none does does the first line-synced result win.
+- De-censoring (`decensor_result` in lyrics.py, on by default,
+  Preferences > Sync > "De-censor lyrics using other sources",
+  config `decensor`): when the auto-fetch winner is censored, the
+  app asks `search_all_candidates` for the other providers' copies
+  of the same track and swaps asterisked words from the first
+  uncensored donor with synced lines. A word is swapped only when
+  `_censored_word_match` proves it — same length, every non-`*`
+  letter matches at the same position (`f**k` → `fuck`, `Sh*t` →
+  `shit`); a fully-asterisked word (`****`) takes the donor word
+  when the rest of the line anchors it (a line of only asterisks
+  still cannot be verified — no anchor words). A donor word that
+  is itself asterisked never matches. Timings ALWAYS stay the
+  winner's own; a fixed word's syllable parts collapse to the whole
+  word. The copy is flagged `LyricsResult.decensored` with
+  `decensored_from` naming the donor provider; `raw_text` keeps the
+  original censored file (the debug view stays honest), and
+  `is_censored` checks the fixed lines instead, so a fully fixed
+  result reports uncensored and a partially fixed one still reports
+  censored. The status bar names the donor
+  (`… (de-censored from LRCLIB)`); the picker labels such a row
+  "de-censored". The picker itself is never de-censored — it shows
+  the raw candidates, uncensored first. Note: `is_censored_text`
+  checks the token's core (via `_split_punct`), so a bare `****`
+  with punctuation attached (`****,`) still counts as censored.
+- Preferences dialog layout: the content lives in a `QScrollArea`
+  (`setWidgetResizable(True)`, horizontal scrollbar off) with the
+  OK/Cancel bar outside it — on a small display the dialog scrolls
+  instead of squashing (the first version's plain layout crushed
+  the sources list to one row). Long labels (`sources_desc_label`,
+  cache label) have `setWordWrap(True)`. The list keeps
+  `setMinimumHeight(200)` + an expanding size policy. Tests:
+  `test_preferences_dialog_layout` shrinks the dialog to 560x480
+  and asserts the list stays ≥200px tall.
 - Explicit / censored lyrics: there is NO explicit filter on any
   provider — the censoring is baked into the data. Better Lyrics
   TTML is uncensored (Kendrick — HUMBLE. returns fuck/shit/bitch

@@ -607,7 +607,13 @@ def test_censored_word_match():
     assert _censored_word_match("ni**a", "nigga")
     assert _censored_word_match("B**ch,", "Bitch,")
     assert not _censored_word_match("f**k", "duck")  # first letter differs
-    assert not _censored_word_match("****", "fuck")  # all asterisks: unverifiable
+    # A fully-asterisked word takes the donor word — the line-level
+    # match is the proof there, since there are no letters to check.
+    assert _censored_word_match("****", "fuck")
+    assert _censored_word_match("****,", "Bitch,")
+    # But a donor word that is itself asterisked never matches.
+    assert not _censored_word_match("****", "f**k")
+    assert not _censored_word_match("f**k", "f**k")
     assert not _censored_word_match("fuck", "fuck")  # not censored at all
     assert not _censored_word_match("f**k", "fucking")  # length differs
     print("  censored word match: OK")
@@ -673,6 +679,24 @@ def test_decensor_result():
                              synced_lines=[_line(5.1, "fuck shit")],
                              source="search", raw_text="fuck shit")
     assert decensor_result(all_cens, [all_donor]) is None
+    # But a fully-asterisked word IS fixed when the rest of the line
+    # anchors it — the line match is the proof.
+    star_cens = LyricsResult(artist="Kendrick Lamar", track="HUMBLE.",
+                             album="DAMN.", duration=177.0,
+                             synced_lines=[_line(30.0, "****, sit down",
+                                                [_word(30.0, 30.5, "****,"),
+                                                 _word(30.5, 31.0, "sit"),
+                                                 _word(31.0, 31.5, "down")])],
+                             source="qq", raw_text="****, sit down")
+    star_donor = LyricsResult(artist="Kendrick Lamar", track="HUMBLE.",
+                              album="DAMN.", duration=177.0,
+                              synced_lines=[_line(30.1, "Bitch, sit down")],
+                              source="search", raw_text="Bitch, sit down")
+    fixed_star = decensor_result(star_cens, [star_donor])
+    assert fixed_star is not None
+    assert fixed_star.synced_lines[0].text == "Bitch, sit down"
+    assert fixed_star.synced_lines[0].words[0].time == 30.0  # timing kept
+    assert fixed_star.decensored is True
     print("  decensor_result: OK")
 
 
