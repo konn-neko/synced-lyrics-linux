@@ -97,57 +97,60 @@ jobs:
       - name: Write run summary
         if: always()
         run: |
-          python - "$RUNNER_TEMP" "$GITHUB_STEP_SUMMARY" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          tmp, out = Path(sys.argv[1]), Path(sys.argv[2])
-          rows, notes = [], []
-
-          lyrics = tmp / "lyrics.log"
-          if lyrics.exists():
-              text = lyrics.read_text(errors="replace")
-              found = re.findall(r"(\d+) passed, (\d+) skipped, (\d+) failed", text)
-              if found:
-                  passed, skipped, failed = found[-1]
-              else:
-                  passed = skipped = "?"
-                  failed = "1" if re.search(r"Traceback|^(FAIL|ERROR) ", text, re.M) else "0"
-              body = [ln for ln in text.splitlines() if ln.strip()]
-              rows.append(["lyrics", passed, skipped, failed, body[-1] if body else "(no output)"])
-              notes += [f"lyrics failure: `{ln}`" for ln in body if re.match(r"^(FAIL|ERROR) ", ln)][:10]
-              if skipped not in ("0", "?"):
-                  notes.append(f"lyrics skipped {skipped} (the test_live_* network checks are off in CI)")
-
-          smoke = tmp / "smoke.log"
-          if smoke.exists():
-              body = [ln for ln in smoke.read_text(errors="replace").splitlines() if ln.strip()]
-              ran = sum(1 for ln in body if ": OK" in ln)
-              skipped = sum(1 for ln in body if re.search(r": SKIP|^SKIP ", ln))
-              done = "test_ui_smoke: OK — all checks passed" in body
-              rows.append(["ui smoke", str(ran), str(skipped), "0" if done else "1",
-                           "test_ui_smoke: OK — all checks passed" if done
-                           else "(suite did not finish)"])
-              if not done:
-                  notes.append("ui smoke stopped after %d checks; last lines: %s"
-                               % (ran, " / ".join(body[-3:])))
-              if skipped:
-                  notes.append("ui smoke skipped %d check(s)" % skipped)
-
-          lines = ["## Suites", "", "| suite | passed | skipped | failed | final line |",
-                   "|---|---|---|---|---|"]
-          if rows:
-              for row in rows:
-                  cells = [str(c).replace("|", "\\|") for c in row]
-                  lines.append("| " + " | ".join(cells) + " |")
-          else:
-              lines.append("| — | — | — | — | failed before any suite ran |")
-          lines += ["", "### Failures and skips", ""]
-          lines += [f"- {note}" for note in notes] or ["- none"]
-          with open(out, "a", encoding="utf-8") as handle:
-              handle.write("\n".join(lines) + "\n")
-          PY
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Suites"
+            echo ""
+            echo "| suite | passed | skipped | failed | final line |"
+            echo "|---|---|---|---|---|"
+            if [ -f "$RUNNER_TEMP/lyrics.log" ]; then
+              counts=$(grep -oE '[0-9]+ passed, [0-9]+ skipped, [0-9]+ failed' "$RUNNER_TEMP/lyrics.log" | tail -1)
+              last=$(grep -v '^[[:space:]]*$' "$RUNNER_TEMP/lyrics.log" | tail -1 | tr '|' '/')
+              if [ -n "$counts" ]; then
+                echo "| lyrics | $(echo "$counts" | cut -d' ' -f1) | $(echo "$counts" | cut -d' ' -f3) | $(echo "$counts" | cut -d' ' -f5) | $last |"
+              else
+                echo "| lyrics | ? | ? | ? | $last |"
+              fi
+            fi
+            if [ -f "$RUNNER_TEMP/smoke.log" ]; then
+              ran=$(grep -c ': OK' "$RUNNER_TEMP/smoke.log" || true)
+              skipped=$(grep -cE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log" || true)
+              if grep -qx 'test_ui_smoke: OK — all checks passed' "$RUNNER_TEMP/smoke.log"; then
+                echo "| ui smoke | $ran | $skipped | 0 | test_ui_smoke: OK — all checks passed |"
+              else
+                echo "| ui smoke | $ran | $skipped | 1 | (suite did not finish) |"
+              fi
+            fi
+            if [ ! -f "$RUNNER_TEMP/lyrics.log" ] && [ ! -f "$RUNNER_TEMP/smoke.log" ]; then
+              echo "| — | — | — | — | failed before any suite ran |"
+            fi
+            echo ""
+            echo "### Failures and skips"
+            echo ""
+            if [ -f "$RUNNER_TEMP/lyrics.log" ] && grep -qE '^(FAIL|ERROR) ' "$RUNNER_TEMP/lyrics.log"; then
+              grep -E '^(FAIL|ERROR) ' "$RUNNER_TEMP/lyrics.log" | head -10 | sed 's/^/- lyrics: /'
+            fi
+            if [ -f "$RUNNER_TEMP/lyrics.log" ] && grep -q '^SKIP ' "$RUNNER_TEMP/lyrics.log"; then
+              echo "- lyrics skipped $(grep -c '^SKIP ' "$RUNNER_TEMP/lyrics.log") (the test_live_* network checks are off in CI)"
+            fi
+            if [ -f "$RUNNER_TEMP/smoke.log" ] && ! grep -qx 'test_ui_smoke: OK — all checks passed' "$RUNNER_TEMP/smoke.log"; then
+              echo "- ui smoke stopped early; last lines:"
+              echo '  ```'
+              grep -v '^[[:space:]]*$' "$RUNNER_TEMP/smoke.log" | tail -3 | sed 's/^/  /'
+              echo '  ```'
+            fi
+            if [ -f "$RUNNER_TEMP/smoke.log" ] && grep -qE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log"; then
+              echo "- ui smoke skipped $(grep -cE ': SKIP|^SKIP ' "$RUNNER_TEMP/smoke.log") check(s)"
+            fi
+            if [ ! -f "$RUNNER_TEMP/lyrics.log" ] && [ ! -f "$RUNNER_TEMP/smoke.log" ]; then
+              echo "- none"
+            fi
+          } >> "$summary"
+          # Self-check: an empty summary would leave a red run unreadable, so say
+          # so on the run page (annotations are public) instead of failing silent.
+          if [ ! -s "$summary" ]; then
+            echo "::warning::CI summary file is empty; the run page has no suite table"
+          fi
 
       # Both suites tee their output to $RUNNER_TEMP. Upload those files
       # unconditionally: a run cut short by the concurrency group still
