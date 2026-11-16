@@ -88,11 +88,13 @@ jobs:
             exit 1
           fi
 
-      # Both suites tee their output to $RUNNER_TEMP. Upload those files only
-      # when something failed, so a red run can be diagnosed from the
-      # artifact instead of the logs API, which needs authentication.
+      # Both suites tee their output to $RUNNER_TEMP. Upload those files
+      # unconditionally: a red run can then be diagnosed from the artifact
+      # instead of the logs API (which needs authentication), and a run cut
+      # short by the concurrency group still leaves its partial logs behind.
+      # The cost is a couple of KB per green run, kept 7 days.
       - name: Upload suite logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: suite-logs-${{ github.run_number }}-${{ github.run_attempt }}
