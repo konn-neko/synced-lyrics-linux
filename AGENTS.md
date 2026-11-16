@@ -299,9 +299,11 @@ no login, no API keys.
   app asks `search_all_candidates` for the other providers' copies
   of the same track and swaps asterisked words from the first
   uncensored donor with synced lines. A word is swapped only when
-  `_censored_word_match` proves it — same length, every non-`*`
+  `_uncensored_word` proves it — same length, every non-`*`
   letter matches at the same position (`f**k` → `fuck`, `Sh*t` →
-  `shit`); a fully-asterisked word (`****`) takes the donor word
+  `shit`); a donor's dropped-g spelling such as `fuckin'` can match
+  `f**king` when the winner's `g` is visible. A fully-asterisked word
+  (`****`) takes the donor word
   when the rest of the line anchors it (a line of only asterisks
   still cannot be verified — no anchor words). A donor word that
   is itself asterisked never matches. "The same line" is an
@@ -311,10 +313,17 @@ no login, no API keys.
   "chachacha"), so the donor line only needs its anchor words to
   line up in order at the same timestamp — a censored word with no
   donor counterpart (the donor drops it) is left alone rather than
-  guessed. Timings ALWAYS stay the winner's own; a fixed word's
+  guessed. Copies also split lines differently (one line in the
+  winner can be two lines in the donor), so when no single donor
+  line aligns, runs of 2–3 consecutive donor lines are tried
+  merged, with the winner line falling inside the merged run's
+  time span. And every uncensored donor is tried line by line —
+  the first donor may fix some lines while a later one fixes the
+  rest. Timings ALWAYS stay the winner's own; a fixed word's
   syllable parts collapse to the whole word. The copy is flagged
-  `LyricsResult.decensored` with `decensored_from` naming the donor
-  provider; `raw_text` keeps the original censored file (the debug
+  `LyricsResult.decensored` with `decensored_from` naming the
+  donor that supplied the most fixed words (ties: first in pool
+  order); `raw_text` keeps the original censored file (the debug
   view stays honest), and `is_censored` checks the fixed lines
   instead, so a fully fixed result reports uncensored and a
   partially fixed one still reports censored. The status bar names
@@ -323,8 +332,10 @@ no login, no API keys.
   shows the raw candidates, uncensored first. Note: `is_censored_text`
   checks the token's core (via `_split_punct`), so a bare `****`
   with punctuation attached (`****,`) still counts as censored.
-  Regression test: `test_decensor_line_variants` (Y2K & bbno$ —
-  Lalala, real NetEase vs LRCLIB lines).
+  Regression tests: `test_decensor_line_variants` (Y2K & bbno$ —
+  Lalala, real NetEase vs LRCLIB lines) and
+  `test_decensor_split_lines` (Ashnikko — Toxic, split lines +
+  multi-donor).
 - Preferences dialog layout: the content lives in a `QScrollArea`
   (`setWidgetResizable(True)`, horizontal scrollbar off) with the
   OK/Cancel bar outside it — on a small display the dialog scrolls

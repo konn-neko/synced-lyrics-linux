@@ -1312,23 +1312,40 @@ def _neighbour_anchored(result: LyricsResult, donor: LyricsResult,
     return confirmed
 
 
+def _line_end(lines: list[LyricLine], idx: int) -> float:
+    """When line `idx` ends: the next line's start, or +3 s for the
+    last line (same convention as `parse_lrc`'s last-word end)."""
+    if idx + 1 < len(lines):
+        return lines[idx + 1].time
+    return lines[idx].time + 3.0
+
+
 def decensor_result(result: LyricsResult,
                     donors: list[LyricsResult]) -> LyricsResult | None:
     """Return a copy of `result` with asterisked words replaced from
     an uncensored donor copy of the same track — or None when nothing
     could be fixed.
 
-    The first uncensored donor with synced lines wins (a different
-    provider than the result itself — the same source would carry the
-    same asterisks). For each censored line, the nearest donor line
-    in time (within 1.0 s) that is provably the same line lends its
+    Every uncensored donor with synced lines is tried (a different
+    provider than the result itself — the same source would carry
+    the same asterisks), line by line, not just the first donor:
+    one donor's copy may segment a line differently while another's
+    matches, so each censored line takes its best match across the
+    whole pool. For each censored line, the nearest donor line in
+    time (within 1.0 s) that is provably the same line lends its
     words; a word is substituted only when it matches the asterisked
     token letter-for-letter around the asterisks — or, when the token
     is fully asterisked (`****`), when the rest of the line anchors
     it. "Provably the same line" is an alignment, not an exact
     match: the donor may drop or add an uncensored word ("like"),
     or hear a word differently ("girly" / "girlie", "shashasha" /
-    "chachacha") — see `_align_lines`. A line of only asterisks has
+    "chachacha") — see `_align_lines`. Copies also split lines
+    differently — one line in the winner can be two lines in the
+    donor ("Like Britney b***h I drop you…" vs "…like Britney,
+    bitch" + "I drop you…", Ashnikko — Toxic, 2026-11-16) — so when
+    no single donor line aligns, runs of 2–3 consecutive donor
+    lines are tried merged, and the winner line must fall inside
+    the merged run's time span. A line of only asterisks has
     no anchor words of its own, so it is proven instead by its
     neighbours: the donor line at the same line number, within 1.0 s,
     with the same word count, and at least one adjacent line
@@ -1339,63 +1356,99 @@ def decensor_result(result: LyricsResult,
     the censored result's own — only word text changes, and a fixed
     word's syllable parts collapse to the whole word (the split is
     lost, the word itself is correct). The copy is flagged
-    `decensored` with `decensored_from` naming the donor provider;
-    `raw_text` keeps the original censored file for the debug view.
+    `decensored` with `decensored_from` naming the donor that
+    supplied the most fixed words; `raw_text` keeps the original
+    censored file for the debug view.
     """
     if not result.is_censored or not result.has_synced:
         return None
-    donor = None
-    for cand in donors:
-        if cand is result or cand.source == result.source:
-            continue
-        if cand.is_censored or not cand.has_synced:
-            continue
-        donor = cand
-        break
-    if donor is None:
+    eligible = [cand for cand in donors
+                if cand is not result and cand.source != result.source
+                and not cand.is_censored and cand.has_synced]
+    if not eligible:
         return None
     # First pass: lines provable on their own (anchor words in the
     # line itself). Record the best donor line per censored line,
-    # with its word alignment — the donor may have a different
-    # word count, so substitutions follow the alignment, not the
-    # position.
-    best_lines: list[tuple[LyricLine, dict[int, int]] | None] = []
+    # with its word alignment and the donor it came from — the donor
+    # may have a different word count, so substitutions follow the
+    # alignment, not the position.
+    # Each entry: (donor source, donor words, {winner_idx: donor_idx}).
+    best_lines: list[tuple[str, list[str], dict[int, int]] | None] = []
     for line in result.synced_lines:
-        best: tuple[LyricLine, dict[int, int]] | None = None
+        best: tuple[str, list[str], dict[int, int]] | None = None
         best_dt = 1.0
-        for dline in donor.synced_lines:
-            dt = abs(dline.time - line.time)
-            if dt > best_dt:
-                continue
-            mapping = _align_lines(line, dline)
-            if mapping is not None:
-                best = (dline, mapping)
-                best_dt = dt
+        for donor in eligible:
+            for dline in donor.synced_lines:
+                dt = abs(dline.time - line.time)
+                if dt > best_dt:
+                    continue
+                mapping = _align_lines(line, dline)
+                if mapping is not None:
+                    best = (donor.source, _donor_words(dline), mapping)
+                    best_dt = dt
+        if best is None:
+            # No single donor line aligns: the donor may have split
+            # this line in two (or three). Try merged runs of
+            # consecutive donor lines whose time span covers the
+            # winner line; the alignment is still the proof.
+            best_dist = None
+            for donor in eligible:
+                dlines = donor.synced_lines
+                for size in (2, 3):
+                    for start in range(len(dlines) - size + 1):
+                        run = dlines[start:start + size]
+                        span_start = run[0].time
+                        span_end = _line_end(dlines, start + size - 1)
+                        if line.time < span_start - 1.0:
+                            continue
+                        if line.time > span_end + 1.0:
+                            continue
+                        dist = 0.0
+                        if line.time < span_start:
+                            dist = span_start - line.time
+                        elif line.time > span_end:
+                            dist = line.time - span_end
+                        if best_dist is not None and dist >= best_dist:
+                            continue
+                        merged = LyricLine(
+                            run[0].time,
+                            " ".join(t.text for t in run))
+                        mapping = _align_lines(line, merged)
+                        if mapping is not None:
+                            best = (donor.source,
+                                    _donor_words(merged), mapping)
+                            best_dist = dist
         best_lines.append(best)
     # Second pass: lines of only asterisks, proven by neighbours.
+    # Any eligible donor may prove one — try them in pool order.
     for i, line in enumerate(result.synced_lines):
         if best_lines[i] is not None or not _is_all_censored(line):
             continue
-        if i >= len(donor.synced_lines):
-            continue
-        dline = donor.synced_lines[i]
-        if abs(dline.time - line.time) > 1.0:
-            continue
         c_words = ([w.text for w in line.words] if line.words
                    else line.text.split())
-        if len(c_words) != len(_donor_words(dline)) or not c_words:
+        if not c_words:
             continue
-        if _neighbour_anchored(result, donor, i):
-            # Same word count here, so the alignment is positional.
-            best_lines[i] = (dline, {k: k for k in range(len(c_words))})
+        for donor in eligible:
+            if i >= len(donor.synced_lines):
+                continue
+            dline = donor.synced_lines[i]
+            if abs(dline.time - line.time) > 1.0:
+                continue
+            if len(c_words) != len(_donor_words(dline)):
+                continue
+            if _neighbour_anchored(result, donor, i):
+                # Same word count here, so the alignment is positional.
+                best_lines[i] = (donor.source, _donor_words(dline),
+                                 {k: k for k in range(len(c_words))})
+                break
     fixed_lines: list[LyricLine] = []
     fixed_any = False
+    fixed_by_source: dict[str, int] = {}
     for line, best in zip(result.synced_lines, best_lines):
         if best is None:
             fixed_lines.append(line)
             continue
-        best_line, mapping = best
-        d_words = _donor_words(best_line)
+        donor_source, d_words, mapping = best
         c_words = ([w.text for w in line.words] if line.words
                    else line.text.split())
         new_text = line.text
@@ -1406,6 +1459,8 @@ def decensor_result(result: LyricsResult,
             if fixed is not None and fixed != c:
                 new_text = new_text.replace(c, fixed, 1)
                 fixed_any = True
+                fixed_by_source[donor_source] = \
+                    fixed_by_source.get(donor_source, 0) + 1
             else:
                 fixed = c
             if line.words:
@@ -1417,9 +1472,17 @@ def decensor_result(result: LyricsResult,
         fixed_lines.append(LyricLine(line.time, new_text, words=new_words))
     if not fixed_any:
         return None
+    # The donor that supplied the most fixed words names the fix
+    # (ties go to the first donor in pool order).
+    pool_order: dict[str, int] = {}
+    for pos, d in enumerate(eligible):
+        pool_order.setdefault(d.source, pos)
+    decensored_from = max(
+        fixed_by_source,
+        key=lambda src: (fixed_by_source[src], -pool_order[src]))
     from dataclasses import replace as _replace
     return _replace(result, synced_lines=fixed_lines, decensored=True,
-                    decensored_from=donor.source)
+                    decensored_from=decensored_from)
 
 
 def _maybe_decensor(result, artist, track, album, duration, order, enabled,

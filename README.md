@@ -348,6 +348,10 @@ word or two — one drops a "like", one hears "lalalala" where the
 other hears "lalala" — so the donor line only needs its anchor
 words to line up, in order, at the same timestamp; a censored
 word with no donor counterpart is left alone rather than guessed.
+Copies also split lines differently, so when no single donor line
+matches, runs of 2–3 consecutive donor lines are tried merged,
+and every uncensored donor is tried line by line — the fix takes
+the best match across the whole pool, not just the first donor.
 A line that is only asterisks is proven by its neighbours
 instead — the donor line at the same line number, within a
 second, with the same word count, flanked by lines that match —
